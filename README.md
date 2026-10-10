@@ -72,16 +72,22 @@ Instead, TokenSwitch routes `chatgpt_oauth` accounts through the internal Codex 
   - `OpenAI-Beta: responses=experimental`
   - `User-Agent: codex_cli_rs/99.99.99`
   - `Accept: text/event-stream`
-- **Supported Codex Models** (discoverable via `GET https://chatgpt.com/backend-api/codex/models?client_version=99.99.99`):
+- **Supported Codex Models** (discoverable via `GET /v1/models` or `GET /v1/codex/models?client_version=99.99.99`):
   - `gpt-6-luna` (**Primary Default**)
   - `gpt-5.6-luna`
   - `gpt-5.6-terra`
   - `gpt-5.5`
   - `gpt-reserve`
   - `codex-auto-review`
-- **Payload & Stream Translation**:
-  - Incoming OpenAI `messages` (`system`, `developer`, `user`, `assistant`) are converted into Codex `input` items (`input_text` / `output_text`) with `instructions`, `store: false`, and `stream: true`.
-  - Upstream SSE events of type `response.output_text.delta` are translated on the fly into standard OpenAI `chat.completion.chunk` SSE frames (`choices[0].delta.content`) or aggregated into a standard `chat.completion` JSON object when `stream: false`.
+- **Multi-Turn Back-and-Forth & Agentic Tool Translation**:
+  - Incoming OpenAI `messages` (`system`, `developer`, `user`, `assistant`, `assistant.tool_calls`, and `role: "tool"` outputs) are converted into Codex `instructions`, `message`, `function_call`, and `function_call_output` items.
+  - Incoming OpenAI `tools` (`type: "function"`) are automatically converted to Codex `tools` definitions, and upstream `response.output_item.added` (`function_call`) + `response.function_call_arguments.delta` SSE frames are streamed back as standard OpenAI `choices[0].delta.tool_calls` with `finish_reason: "tool_calls"`.
+  - Native Codex CLI / Responses API clients calling `POST /v1/responses` directly with `input` receive raw upstream Codex SSE events (`response.created`, `response.output_text.delta`, `response.completed`) untouched.
+- **Automatic Server-Side KV Prompt Caching (`cached_tokens`)**:
+  - Standard OpenAI SDK clients do not send Codex-specific headers (`session_id`, `x-codex-turn-state`, or `__oailb` gateway affinity cookies).
+  - TokenSwitch automatically derives a deterministic UUID v4 `prompt_cache_key` / `session_id` per conversation thread (from the active route, system prompt, first user message, and tool names), or honors explicit `prompt_cache_key` / `session_id` / `x-session-id` headers when provided.
+  - On every response, TokenSwitch captures the upstream `x-codex-turn-state` header and OpenAI/Cloudflare load-balancer affinity cookies (`__oailb`, `__cflb`, `__cf_bm`) in `data/turn_states.json` and replays them on subsequent turns of the same conversation.
+  - This routes Turn 2+ to the exact same OpenAI edge gateway and GPU worker holding the KV cache, returning `usage.prompt_tokens_details.cached_tokens` (and the `X-Cache-Tokens` response header) automatically.
 - **Silent Token Auto-Refresh**:
   - If an access token expires (`HTTP 401`), TokenSwitch automatically calls `POST https://auth.openai.com/oauth/token` with `grant_type=refresh_token` and `client_id=app_EMoamEEZ73f0CkXaXp7hrann`, saves the new JWT to `data/tokens.json`, and retries the request transparently.
 
@@ -137,8 +143,8 @@ for chunk in stream:
 
 | File / Path | Description |
 | :--- | :--- |
-| [`index.php`](index.php) | Complete production web gateway, solid dark UI dashboard, per-account model switcher, OAuth token auto-refresher, and Codex Rust SSE translator. |
-| [`src/login_tool.rs`](src/login_tool.rs) | Standalone, zero-dependency Rust source for `tokenswitch-login.exe` (multi-threaded loopback OAuth listener on port `1455`). |
+| [`index.php`](index.php) | Complete production web gateway, solid dark UI dashboard, per-account model switcher, OAuth token auto-refresher, server-side KV prompt cache manager, and Codex Rust SSE translator. |
+| [`src/login_tool.rs`](src/login_tool.rs) | Standalone, zero-dependency Rust source for `tokenswitch-login.exe` (multi-threaded loopback OAuth listener on port `1455` with `prompt=login` for multi-account sign-in). |
 | [`tokenswitch-login.exe`](tokenswitch-login.exe) | Precompiled Windows binary for the local OpenAI browser login helper. |
 | [`login.bat`](login.bat) | One-click Windows launcher for `tokenswitch-login.exe`. |
 | [`src/main.rs`](src/main.rs) / [`src/server.rs`](src/server.rs) / [`src/switcher.rs`](src/switcher.rs) | Local Rust Axum server implementation of TokenSwitch. |
@@ -165,9 +171,11 @@ Or double-click `login.bat` to start the listener and open the login flow immedi
 
 | Method & Path | Auth | Description |
 | :--- | :--- | :--- |
-| `POST /v1/chat/completions` | `Bearer <key>` or Session | Proxies chat completion requests (streaming & non-streaming) via Codex backend or standard OpenAI API with automatic failover. |
+| `POST /v1/chat/completions` | `Bearer <key>` or Session | Proxies multi-turn chat completion & tool-call requests (streaming & non-streaming) with automatic KV prompt caching and account failover. |
+| `POST /v1/responses` | `Bearer <key>` or Session | Native OpenAI Responses / Codex CLI endpoint (`input`, `instructions`, `tools`, `prompt_cache_key`) with raw Codex SSE streaming. |
+| `GET /v1/models` | `Bearer <key>` or Session | Returns OpenAI-compatible model list (`gpt-6-luna`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.5`, etc.) or proxies native Codex `/models?client_version=...` catalog. |
 | `GET /api/status` | Session | Returns current routing strategy (`priority_fallback`, `round_robin`, `least_errors`), active route, and account pool telemetry. |
-| `GET /api/export` | `Bearer <key>` or Session | Exports ready-to-use `.env`, JSON, Bash, and PowerShell configuration snippets + live quota telemetry. |
+| `GET /api/export` | `Bearer <key>` or Session | Exports ready-to-use `.env`, JSON, Bash, and PowerShell configuration snippets + live quota & cache telemetry. |
 | `POST /api/usage/sync` | `Bearer <key>` or Session | Polls `https://chatgpt.com/backend-api/wham/usage` across all connected Codex OAuth accounts and updates remaining quota %, reset timers, and plan tier. |
 | `POST /api/accounts/oauth-connect` | `Bearer <key>` or Session | Registers or updates a ChatGPT OAuth account (`token`, `refresh_token`, `model`, `priority`) and fetches initial quota. |
 | `POST /api/accounts/{id}/model` | Session | Updates the target model (`gpt-6-luna`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.5`, etc.) for a specific account. |
@@ -176,12 +184,13 @@ Or double-click `login.bat` to start the listener and open the login flow immedi
 | `POST /api/strategy` | Session | Changes the pool routing strategy (`priority_fallback`, `round_robin`, `least_errors`). |
 | `POST /api/report` | Session | Simulates or reports an HTTP error (e.g. `429`) on an account to trigger cooldown and failover. |
 
-### Quota & Token Usage Telemetry
-TokenSwitch tracks both **real-time OpenAI Codex quota remaining (%)** and **exact per-account token consumption**:
+### Quota, Token Usage & Prompt Cache Telemetry
+TokenSwitch tracks **real-time OpenAI Codex quota remaining (%)**, **exact per-account token consumption**, and **KV prompt cache hits (`cached_tokens`)**:
 1. **Live Quota Sync (`GET https://chatgpt.com/backend-api/wham/usage`)**:
    - Returns `plan_type` (`free`, `plus`, `pro`, `team`), `used_percent`, `remaining_percent` (`100 - used_percent`), and `reset_at` / `reset_after_seconds`.
 2. **Zero-Overhead Inference Header Capture (`x-codex-*`)**:
-   - Every `/backend-api/codex/responses` call automatically captures `x-codex-primary-used-percent`, `x-codex-plan-type`, and `x-codex-primary-reset-at` response headers via `CURLOPT_HEADERFUNCTION`, updating the account's remaining quota bar in real time without extra HTTP requests.
-3. **Exact Token Counters (`response.completed`)**:
-   - Extracts `input_tokens`, `output_tokens`, and `total_tokens` from the final `response.completed` SSE frame, returning standard OpenAI `usage` statistics to clients and accumulating `total_tokens`, `prompt_tokens`, and `completion_tokens` per account.
+   - Every `/backend-api/codex/responses` call automatically captures `x-codex-primary-used-percent`, `x-codex-plan-type`, `x-codex-primary-reset-at`, `x-codex-turn-state`, and load-balancer affinity cookies (`__oailb`, `__cflb`) via `CURLOPT_HEADERFUNCTION`.
+3. **Exact Token & Cache Counters (`response.completed`)**:
+   - Extracts `input_tokens`, `output_tokens`, `total_tokens`, and `input_tokens_details.cached_tokens` from the final `response.completed` SSE frame, returning standard OpenAI `usage.prompt_tokens_details.cached_tokens` to clients and accumulating `total_tokens`, `prompt_tokens`, `completion_tokens`, and `cached_tokens` per account.
+
 

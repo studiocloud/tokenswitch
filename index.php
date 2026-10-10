@@ -62,15 +62,30 @@ function save_state($file, $data) {
 $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $method = $_SERVER['REQUEST_METHOD'];
 
+// Global CORS & Preflight support for IDE extensions, SDKs, and Codex clients
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
+header('Access-Control-Allow-Headers: Authorization, Content-Type, Accept, OpenAI-Beta, originator, session_id, x-codex-turn-state, x-session-id, x-prompt-cache-key, User-Agent');
+header('Access-Control-Expose-Headers: X-Routed-Account, X-Routed-Model, X-Quota-Remaining-Percent, X-Cache-Tokens, X-Session-Id, x-codex-turn-state, x-models-etag');
+if ($method === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
+
 function is_authenticated() {
     return isset($_SESSION['auth_user']) && $_SESSION['auth_user'] === AUTH_EMAIL;
 }
 
 function check_proxy_auth() {
     if (is_authenticated()) return true;
-    $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+    $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? ($_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '');
+    if (empty($auth) && function_exists('apache_request_headers')) {
+        $hdrs = apache_request_headers();
+        $auth = $hdrs['Authorization'] ?? ($hdrs['authorization'] ?? '');
+    }
     if (preg_match('/Bearer\s+(.*)$/i', $auth, $m)) {
-        if ($m[1] === AUTH_PASSWORD || $m[1] === 'tokenswitch-key') {
+        $key = trim($m[1]);
+        if ($key === AUTH_PASSWORD || $key === 'tokenswitch-key') {
             return true;
         }
     }
@@ -295,7 +310,7 @@ if ($uri === '/auth/callback') {
             'base_url' => 'https://api.openai.com/v1',
             'api_key' => $access_token,
             'refresh_token' => $refresh_token ?: null,
-            'model' => 'gpt-4o',
+            'model' => 'gpt-6-luna',
             'priority' => 1,
             'cooldown_secs' => 60,
             'enabled' => true,
@@ -303,6 +318,10 @@ if ($uri === '/auth/callback') {
             'total_requests' => 0,
             'total_successes' => 0,
             'total_failures' => 0,
+            'total_tokens' => 0,
+            'prompt_tokens' => 0,
+            'completion_tokens' => 0,
+            'cached_tokens' => 0,
             'cooldown_until' => 0,
             'last_error' => null
         ];
@@ -375,6 +394,7 @@ if ($uri === '/api/status' && $method === 'GET') {
             'total_tokens' => $acc['total_tokens'] ?? 0,
             'prompt_tokens' => $acc['prompt_tokens'] ?? 0,
             'completion_tokens' => $acc['completion_tokens'] ?? 0,
+            'cached_tokens' => $acc['cached_tokens'] ?? 0,
             'quota' => $acc['quota'] ?? null,
             'last_error' => $acc['last_error'] ?? null,
             'is_active_route' => ($acc['id'] === $active_id)
@@ -419,7 +439,8 @@ if ($uri === '/api/export' && $method === 'GET') {
         'auth_type' => $route['auth_type'] ?? 'api_key',
         'upstream_token' => $route['api_key'],
         'quota' => $route['quota'] ?? null,
-        'total_tokens' => $route['total_tokens'] ?? 0
+        'total_tokens' => $route['total_tokens'] ?? 0,
+        'cached_tokens' => $route['cached_tokens'] ?? 0
     ], JSON_PRETTY_PRINT);
     $bash = "export OPENAI_BASE_URL=\"{$proxy_base}\"\nexport OPENAI_API_KEY=\"{$proxy_key}\"\nexport OPENAI_MODEL=\"{$route['model']}\"";
     $powershell = "\$env:OPENAI_BASE_URL=\"{$proxy_base}\"\n\$env:OPENAI_API_KEY=\"{$proxy_key}\"\n\$env:OPENAI_MODEL=\"{$route['model']}\"";
@@ -779,6 +800,149 @@ if ($uri === '/api/report' && $method === 'POST') {
     exit;
 }
 
+// ---------------- MODEL DISCOVERY ENDPOINT (/v1/models) ----------------
+if (($uri === '/v1/models' || $uri === '/models' || $uri === '/v1/codex/models' || preg_match('#^/v1/models/([^/]+)$#', $uri)) && $method === 'GET') {
+    if (!is_authenticated() && !check_proxy_auth()) {
+        http_response_code(401);
+        echo json_encode(['error' => ['message' => 'Unauthorized. Provide Bearer token or log in.']]);
+        exit;
+    }
+
+    $state = load_state($DATA_FILE);
+    $route = get_active_route($state);
+
+    // If native Codex CLI requests /v1/models?client_version=... or /v1/codex/models
+    if ((isset($_GET['client_version']) || $uri === '/v1/codex/models') && $route) {
+        $api_key = $route['api_key'] ?? '';
+        if (str_starts_with($api_key, 'eyJ')) {
+            $claims = extract_jwt_claims($api_key);
+            $chatgpt_acc_id = $claims['https://api.openai.com/auth']['chatgpt_account_id'] ?? '';
+            $hdrs = [
+                "Authorization: Bearer $api_key",
+                "originator: codex_cli_rs",
+                "User-Agent: codex_cli_rs/99.99.99",
+                "Accept: application/json"
+            ];
+            if (!empty($chatgpt_acc_id)) $hdrs[] = "ChatGPT-Account-Id: $chatgpt_acc_id";
+            $ch = curl_init('https://chatgpt.com/backend-api/codex/models?client_version=99.99.99');
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 15,
+                CURLOPT_HTTPHEADER => $hdrs
+            ]);
+            $res = curl_exec($ch);
+            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            if ($code === 200 && !empty($res)) {
+                header('Content-Type: application/json');
+                echo $res;
+                exit;
+            }
+        }
+    }
+
+    $models = [
+        'gpt-6-luna',
+        'gpt-5.6-luna',
+        'gpt-5.6-terra',
+        'gpt-5.5',
+        'gpt-reserve',
+        'codex-auto-review',
+        'gpt-4o',
+        'gpt-4o-mini',
+        'o3-mini',
+        'o1'
+    ];
+
+    if (preg_match('#^/v1/models/([^/]+)$#', $uri, $m)) {
+        $req_m = urldecode($m[1]);
+        header('Content-Type: application/json');
+        echo json_encode([
+            'id' => $req_m,
+            'object' => 'model',
+            'created' => 1770000000,
+            'owned_by' => 'openai-codex-tokenswitch'
+        ]);
+        exit;
+    }
+
+    $data = array_map(fn($m) => [
+        'id' => $m,
+        'object' => 'model',
+        'created' => 1770000000,
+        'owned_by' => 'openai-codex-tokenswitch'
+    ], $models);
+
+    header('Content-Type: application/json');
+    echo json_encode(['object' => 'list', 'data' => $data]);
+    exit;
+}
+
+// ---------------- CODEX PROMPT CACHE & TURN-STATE ENGINE ----------------
+$TURN_STATE_FILE = $DATA_DIR . '/turn_states.json';
+
+function format_uuid_from_seed($seed) {
+    $h = md5($seed);
+    return sprintf(
+        '%s-%s-4%s-%s%s-%s',
+        substr($h, 0, 8),
+        substr($h, 8, 4),
+        substr($h, 13, 3),
+        dechex(8 | (hexdec($h[16]) & 3)),
+        substr($h, 17, 3),
+        substr($h, 20, 12)
+    );
+}
+
+function get_saved_turn_state($cache_key) {
+    global $TURN_STATE_FILE;
+    $client_ts = !empty($_SERVER['HTTP_X_CODEX_TURN_STATE']) ? trim($_SERVER['HTTP_X_CODEX_TURN_STATE']) : null;
+    if (empty($cache_key) || !file_exists($TURN_STATE_FILE)) {
+        return $client_ts ? ['turn_state' => $client_ts, 'cookies' => ''] : null;
+    }
+    $raw = @file_get_contents($TURN_STATE_FILE);
+    $map = json_decode($raw, true);
+    if (!is_array($map) || !isset($map[$cache_key])) {
+        return $client_ts ? ['turn_state' => $client_ts, 'cookies' => ''] : null;
+    }
+    $entry = $map[$cache_key];
+    if ((time() - ($entry['updated_at'] ?? 0)) > 7200) return null;
+    if ($client_ts) $entry['turn_state'] = $client_ts;
+    return $entry;
+}
+
+function save_turn_state($cache_key, $turn_state, $cookies = '') {
+    global $TURN_STATE_FILE;
+    if (empty($cache_key)) return;
+    $map = [];
+    if (file_exists($TURN_STATE_FILE)) {
+        $raw = @file_get_contents($TURN_STATE_FILE);
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) $map = $decoded;
+    }
+    $now = time();
+    foreach ($map as $k => $v) {
+        if (($now - ($v['updated_at'] ?? 0)) > 7200) {
+            unset($map[$k]);
+        }
+    }
+    if (count($map) > 200) {
+        uasort($map, fn($a, $b) => ($a['updated_at'] ?? 0) <=> ($b['updated_at'] ?? 0));
+        $map = array_slice($map, -150, null, true);
+    }
+    if (empty($turn_state) && empty($cookies)) {
+        unset($map[$cache_key]);
+    } else {
+        $prev_cookies = $map[$cache_key]['cookies'] ?? '';
+        $map[$cache_key] = [
+            'turn_state' => $turn_state,
+            'cookies' => !empty($cookies) ? $cookies : $prev_cookies,
+            'updated_at' => $now
+        ];
+    }
+    @file_put_contents($TURN_STATE_FILE, json_encode($map), LOCK_EX);
+}
+
 // Map standard model names to valid Codex backend slugs
 function resolve_codex_model($requested_model, $route_model) {
     $valid_codex_models = [
@@ -798,41 +962,155 @@ function resolve_codex_model($requested_model, $route_model) {
     return 'gpt-6-luna';
 }
 
-// Convert OpenAI Chat Completions payload to Codex Responses payload
-function build_codex_payload($payload, $codex_model) {
-    $instructions = "You are a helpful, capable AI assistant. Respond directly and accurately to the user's request.";
+// Extract text helper from message content
+function extract_message_text($content_raw) {
+    if (is_string($content_raw)) return $content_raw;
+    if (is_array($content_raw)) {
+        $text = '';
+        foreach ($content_raw as $part) {
+            if (is_string($part)) {
+                $text .= $part;
+            } elseif (isset($part['text'])) {
+                $text .= $part['text'];
+            } elseif (isset($part['input_text'])) {
+                $text .= $part['input_text'];
+            }
+        }
+        return $text;
+    }
+    return '';
+}
+
+// Convert OpenAI Chat Completions OR Native Responses payload into Codex Responses payload + cache key
+function build_codex_payload($payload, $codex_model, $route_id = 'default') {
+    // 1. Check if payload is already in Native Responses API format (has 'input' and not 'messages')
+    if (isset($payload['input']) && !isset($payload['messages'])) {
+        $codex_payload = $payload;
+        $codex_payload['model'] = $codex_model;
+        if (empty($codex_payload['instructions'])) {
+            $codex_payload['instructions'] = "You are a helpful, capable AI assistant and coding agent.";
+        }
+        if (is_string($codex_payload['input'])) {
+            $codex_payload['input'] = [
+                [
+                    'type' => 'message',
+                    'role' => 'user',
+                    'content' => [['type' => 'input_text', 'text' => $codex_payload['input']]]
+                ]
+            ];
+        }
+        $codex_payload['store'] = false;
+        $codex_payload['stream'] = true;
+
+        $first_user = '';
+        foreach ($codex_payload['input'] as $item) {
+            if (($item['role'] ?? '') === 'user') {
+                $first_user = extract_message_text($item['content'] ?? '');
+                if ($first_user !== '') break;
+            }
+        }
+        $explicit_key = $payload['prompt_cache_key']
+            ?? ($payload['session_id']
+            ?? ($_SERVER['HTTP_SESSION_ID']
+            ?? ($_SERVER['HTTP_X_SESSION_ID']
+            ?? ($_SERVER['HTTP_X_PROMPT_CACHE_KEY']
+            ?? ($payload['user'] ?? '')))));
+        $cache_key = !empty($explicit_key)
+            ? (string)$explicit_key
+            : format_uuid_from_seed($route_id . '|' . $codex_payload['instructions'] . '|' . substr($first_user, 0, 512));
+
+        $codex_payload['prompt_cache_key'] = $cache_key;
+        unset($codex_payload['max_tokens'], $codex_payload['max_completion_tokens'], $codex_payload['temperature'], $codex_payload['top_p'], $codex_payload['stream_options'], $codex_payload['user'], $codex_payload['session_id']);
+        return [$codex_payload, $cache_key];
+    }
+
+    // 2. Standard Chat Completions format -> Full bidirectional Codex Responses translation
+    $sys_parts = [];
     $input = [];
+    $first_user_text = '';
 
     $messages = $payload['messages'] ?? [];
     foreach ($messages as $msg) {
         $role = $msg['role'] ?? 'user';
         $content_raw = $msg['content'] ?? '';
-        $text = '';
-        if (is_string($content_raw)) {
-            $text = $content_raw;
-        } elseif (is_array($content_raw)) {
-            foreach ($content_raw as $part) {
-                if (isset($part['text'])) $text .= $part['text'];
-            }
-        }
+        $text = extract_message_text($content_raw);
 
         if ($role === 'system' || $role === 'developer') {
-            $input[] = [
-                'type' => 'message',
-                'role' => 'developer',
-                'content' => [['type' => 'input_text', 'text' => $text]]
-            ];
+            if ($text !== '') {
+                $sys_parts[] = $text;
+            }
         } elseif ($role === 'assistant') {
+            if ($text !== '') {
+                $input[] = [
+                    'type' => 'message',
+                    'role' => 'assistant',
+                    'content' => [['type' => 'output_text', 'text' => $text]]
+                ];
+            }
+            if (!empty($msg['tool_calls']) && is_array($msg['tool_calls'])) {
+                foreach ($msg['tool_calls'] as $tc) {
+                    $call_id = $tc['id'] ?? ($tc['call_id'] ?? ('call_' . bin2hex(random_bytes(8))));
+                    $fn_name = $tc['function']['name'] ?? ($tc['name'] ?? 'unknown_tool');
+                    $fn_args = $tc['function']['arguments'] ?? ($tc['arguments'] ?? '{}');
+                    if (!is_string($fn_args)) {
+                        $fn_args = json_encode($fn_args);
+                    }
+                    $input[] = [
+                        'type' => 'function_call',
+                        'call_id' => $call_id,
+                        'name' => $fn_name,
+                        'arguments' => $fn_args
+                    ];
+                }
+            } elseif (!empty($msg['function_call']) && is_array($msg['function_call'])) {
+                $fc = $msg['function_call'];
+                $call_id = $fc['id'] ?? ('call_' . bin2hex(random_bytes(8)));
+                $fn_name = $fc['name'] ?? 'unknown_tool';
+                $fn_args = $fc['arguments'] ?? '{}';
+                if (!is_string($fn_args)) $fn_args = json_encode($fn_args);
+                $input[] = [
+                    'type' => 'function_call',
+                    'call_id' => $call_id,
+                    'name' => $fn_name,
+                    'arguments' => $fn_args
+                ];
+            }
+        } elseif ($role === 'tool' || $role === 'function') {
+            $call_id = $msg['tool_call_id'] ?? ($msg['call_id'] ?? ($msg['name'] ?? 'call_unknown'));
+            $out_str = is_string($content_raw) ? $content_raw : json_encode($content_raw);
             $input[] = [
-                'type' => 'message',
-                'role' => 'assistant',
-                'content' => [['type' => 'output_text', 'text' => $text]]
+                'type' => 'function_call_output',
+                'call_id' => $call_id,
+                'output' => $out_str
             ];
         } else {
+            // User message (supports text + multimodal image_url)
+            if ($first_user_text === '' && $text !== '') {
+                $first_user_text = $text;
+            }
+            $user_content = [];
+            if (is_array($content_raw)) {
+                foreach ($content_raw as $part) {
+                    $ptype = $part['type'] ?? 'text';
+                    if ($ptype === 'text' || $ptype === 'input_text') {
+                        $user_content[] = ['type' => 'input_text', 'text' => (string)($part['text'] ?? '')];
+                    } elseif ($ptype === 'image_url' && isset($part['image_url'])) {
+                        $img_url = is_array($part['image_url']) ? ($part['image_url']['url'] ?? '') : (string)$part['image_url'];
+                        if ($img_url !== '') {
+                            $user_content[] = ['type' => 'input_image', 'image_url' => $img_url];
+                        }
+                    } elseif ($ptype === 'input_image') {
+                        $user_content[] = $part;
+                    }
+                }
+            }
+            if (empty($user_content)) {
+                $user_content[] = ['type' => 'input_text', 'text' => $text];
+            }
             $input[] = [
                 'type' => 'message',
                 'role' => 'user',
-                'content' => [['type' => 'input_text', 'text' => $text]]
+                'content' => $user_content
             ];
         }
     }
@@ -845,21 +1123,79 @@ function build_codex_payload($payload, $codex_model) {
         ];
     }
 
-    return [
+    $instructions = !empty($sys_parts)
+        ? implode("\n\n", $sys_parts)
+        : ($payload['instructions'] ?? "You are a helpful, capable AI assistant. Respond directly and accurately to the user's request.");
+
+    // Translate tools into Codex Responses format
+    $codex_tools = [];
+    $tool_names = [];
+    if (!empty($payload['tools']) && is_array($payload['tools'])) {
+        foreach ($payload['tools'] as $t) {
+            if (($t['type'] ?? '') === 'function' && isset($t['function']) && is_array($t['function'])) {
+                $fn = $t['function'];
+                $name = $fn['name'] ?? 'unnamed_tool';
+                $tool_names[] = $name;
+                $ct = [
+                    'type' => 'function',
+                    'name' => $name,
+                    'description' => $fn['description'] ?? '',
+                    'parameters' => $fn['parameters'] ?? ['type' => 'object', 'properties' => new stdClass()]
+                ];
+                if (isset($fn['strict'])) $ct['strict'] = (bool)$fn['strict'];
+                $codex_tools[] = $ct;
+            } elseif (isset($t['type'])) {
+                if (isset($t['name'])) $tool_names[] = $t['name'];
+                $codex_tools[] = $t;
+            }
+        }
+    }
+
+    // Translate tool_choice
+    $tool_choice = $payload['tool_choice'] ?? 'auto';
+    if (is_array($tool_choice) && ($tool_choice['type'] ?? '') === 'function' && isset($tool_choice['function']['name'])) {
+        $tool_choice = [
+            'type' => 'function',
+            'name' => $tool_choice['function']['name']
+        ];
+    }
+
+    // Determine deterministic or explicit session/prompt_cache_key for automatic multi-turn KV cache hits
+    $explicit_key = $payload['prompt_cache_key']
+        ?? ($payload['session_id']
+        ?? ($payload['conversation_id']
+        ?? ($payload['metadata']['session_id']
+        ?? ($_SERVER['HTTP_SESSION_ID']
+        ?? ($_SERVER['HTTP_X_SESSION_ID']
+        ?? ($_SERVER['HTTP_X_PROMPT_CACHE_KEY']
+        ?? ($payload['user'] ?? '')))))));
+
+    $cache_key = !empty($explicit_key)
+        ? (string)$explicit_key
+        : format_uuid_from_seed($route_id . '|' . $instructions . '|' . substr($first_user_text, 0, 512) . '|' . implode(',', $tool_names));
+
+    $parallel_tool_calls = isset($payload['parallel_tool_calls']) ? (bool)$payload['parallel_tool_calls'] : !empty($codex_tools);
+
+    $codex_payload = [
         'model' => $codex_model,
         'instructions' => $instructions,
+        'prompt_cache_key' => $cache_key,
         'input' => $input,
-        'tools' => [],
-        'tool_choice' => 'auto',
-        'parallel_tool_calls' => false,
-        'reasoning' => ['summary' => 'auto'],
+        'tools' => $codex_tools,
+        'tool_choice' => $tool_choice,
+        'parallel_tool_calls' => $parallel_tool_calls,
         'store' => false,
         'stream' => true
     ];
+    if (!empty($payload['reasoning'])) {
+        $codex_payload['reasoning'] = $payload['reasoning'];
+    }
+
+    return [$codex_payload, $cache_key];
 }
 
-// Execute Codex Backend Request
-function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $codex_model) {
+// Execute Codex Backend Request (Supports both Chat Completions translation & Native Responses pass-through)
+function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $codex_model, $cache_key = null, $native_responses_mode = false, $allow_turn_state = true) {
     $claims = extract_jwt_claims($api_key);
     $chatgpt_acc_id = $claims['https://api.openai.com/auth']['chatgpt_account_id'] ?? '';
 
@@ -874,6 +1210,16 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
     if (!empty($chatgpt_acc_id)) {
         $headers[] = "ChatGPT-Account-Id: $chatgpt_acc_id";
     }
+    $saved_entry = (!empty($cache_key) && $allow_turn_state) ? get_saved_turn_state($cache_key) : null;
+    if (!empty($cache_key)) {
+        $headers[] = "session_id: $cache_key";
+        if (!empty($saved_entry['turn_state'])) {
+            $headers[] = "x-codex-turn-state: {$saved_entry['turn_state']}";
+        }
+        if (!empty($saved_entry['cookies'])) {
+            $headers[] = "Cookie: {$saved_entry['cookies']}";
+        }
+    }
 
     $ch = curl_init('https://chatgpt.com/backend-api/codex/responses');
     $raw_response = '';
@@ -881,27 +1227,63 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
     $headers_sent = false;
     $chunk_id = 'chatcmpl-' . bin2hex(random_bytes(6));
     $live_headers = [];
+    $live_cookies = [];
+    $tool_calls_map = [];
+    $item_id_to_tool_idx = [];
+    $next_tool_idx = 0;
+    $completed_response_obj = null;
     $usage_stats = [
         'prompt_tokens' => 0,
         'completion_tokens' => 0,
-        'total_tokens' => 0
+        'total_tokens' => 0,
+        'cached_tokens' => 0,
+        'reasoning_tokens' => 0
     ];
 
     curl_setopt_array($ch, [
         CURLOPT_POST => true,
         CURLOPT_POSTFIELDS => json_encode($codex_payload),
-        CURLOPT_TIMEOUT => 120,
+        CURLOPT_TIMEOUT => 180,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_RETURNTRANSFER => false,
-        CURLOPT_HEADERFUNCTION => function($ch, $header_line) use (&$live_headers) {
+        CURLOPT_HEADERFUNCTION => function($ch, $header_line) use (&$live_headers, &$live_cookies) {
             $len = strlen($header_line);
             $parts = explode(':', $header_line, 2);
             if (count($parts) === 2) {
-                $live_headers[strtolower(trim($parts[0]))] = trim($parts[1]);
+                $k = strtolower(trim($parts[0]));
+                $v = trim($parts[1]);
+                $live_headers[$k] = $v;
+                if ($k === 'set-cookie') {
+                    if (preg_match_all('/(?:^|,\s*)([a-zA-Z0-9_\-]+)=([^;,\s]+)/', $v, $matches, PREG_SET_ORDER)) {
+                        foreach ($matches as $m) {
+                            $cname = $m[1];
+                            $lc = strtolower($cname);
+                            if (!in_array($lc, ['expires', 'path', 'domain', 'max-age', 'samesite', 'secure', 'httponly'], true)) {
+                                $live_cookies[$cname] = $cname . '=' . $m[2];
+                            }
+                        }
+                    }
+                }
             }
             return $len;
         },
-        CURLOPT_WRITEFUNCTION => function($ch, $data) use (&$raw_response, &$full_text, &$headers_sent, &$usage_stats, &$live_headers, $is_stream, $route_name, $codex_model, $chunk_id) {
+        CURLOPT_WRITEFUNCTION => function($ch, $data) use (
+            &$raw_response,
+            &$full_text,
+            &$headers_sent,
+            &$usage_stats,
+            &$live_headers,
+            &$tool_calls_map,
+            &$item_id_to_tool_idx,
+            &$next_tool_idx,
+            &$completed_response_obj,
+            $is_stream,
+            $route_name,
+            $codex_model,
+            $chunk_id,
+            $cache_key,
+            $native_responses_mode
+        ) {
             $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             if ($http_code !== 200) {
                 $raw_response .= $data;
@@ -915,6 +1297,15 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 header('X-Accel-Buffering: no');
                 header("X-Routed-Account: $route_name");
                 header("X-Routed-Model: $codex_model");
+                if (!empty($cache_key)) {
+                    header("X-Session-Id: $cache_key");
+                }
+                if (!empty($live_headers['x-codex-turn-state'])) {
+                    header("x-codex-turn-state: {$live_headers['x-codex-turn-state']}");
+                }
+                if (!empty($live_headers['x-models-etag'])) {
+                    header("x-models-etag: {$live_headers['x-models-etag']}");
+                }
                 if (isset($live_headers['x-codex-primary-used-percent'])) {
                     $rem = max(0, 100 - floatval($live_headers['x-codex-primary-used-percent']));
                     header("X-Quota-Remaining-Percent: $rem");
@@ -925,6 +1316,13 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 $headers_sent = true;
             }
 
+            // If Native Responses Mode & streaming, forward raw SSE frames directly while still parsing usage in background
+            if ($native_responses_mode && $is_stream) {
+                echo $data;
+                @ob_flush();
+                @flush();
+            }
+
             static $line_buf = '';
             $line_buf .= $data;
             $lines = explode("\n", $line_buf);
@@ -932,37 +1330,143 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
 
             foreach ($lines as $line) {
                 $trimmed = trim($line);
-                if (str_starts_with($trimmed, 'data: ')) {
-                    $json_str = substr($trimmed, 6);
-                    $ev = json_decode($json_str, true);
-                    if (isset($ev['type'])) {
-                        if ($ev['type'] === 'response.output_text.delta' && isset($ev['delta'])) {
-                            $delta_text = $ev['delta'];
-                            $full_text .= $delta_text;
-                            if ($is_stream) {
-                                $out_chunk = [
-                                    'id' => $chunk_id,
-                                    'object' => 'chat.completion.chunk',
-                                    'created' => time(),
-                                    'model' => $codex_model,
-                                    'choices' => [
-                                        [
-                                            'index' => 0,
-                                            'delta' => ['content' => $delta_text],
-                                            'finish_reason' => null
-                                        ]
+                if (!str_starts_with($trimmed, 'data: ')) continue;
+                $json_str = substr($trimmed, 6);
+                $ev = json_decode($json_str, true);
+                if (!is_array($ev) || !isset($ev['type'])) continue;
+
+                $ev_type = $ev['type'];
+
+                if ($ev_type === 'response.output_text.delta' && isset($ev['delta'])) {
+                    $delta_text = $ev['delta'];
+                    $full_text .= $delta_text;
+                    if ($is_stream && !$native_responses_mode) {
+                        $out_chunk = [
+                            'id' => $chunk_id,
+                            'object' => 'chat.completion.chunk',
+                            'created' => time(),
+                            'model' => $codex_model,
+                            'choices' => [
+                                [
+                                    'index' => 0,
+                                    'delta' => ['content' => $delta_text],
+                                    'finish_reason' => null
+                                ]
+                            ]
+                        ];
+                        echo "data: " . json_encode($out_chunk) . "\n\n";
+                        @ob_flush();
+                        @flush();
+                    }
+                } elseif ($ev_type === 'response.reasoning_summary_text.delta' && isset($ev['delta'])) {
+                    if ($is_stream && !$native_responses_mode) {
+                        $out_chunk = [
+                            'id' => $chunk_id,
+                            'object' => 'chat.completion.chunk',
+                            'created' => time(),
+                            'model' => $codex_model,
+                            'choices' => [
+                                [
+                                    'index' => 0,
+                                    'delta' => ['reasoning_content' => $ev['delta']],
+                                    'finish_reason' => null
+                                ]
+                            ]
+                        ];
+                        echo "data: " . json_encode($out_chunk) . "\n\n";
+                        @ob_flush();
+                        @flush();
+                    }
+                } elseif ($ev_type === 'response.output_item.added' && isset($ev['item'])) {
+                    $item = $ev['item'];
+                    if (($item['type'] ?? '') === 'function_call') {
+                        $item_id = $item['id'] ?? ('fc_' . $next_tool_idx);
+                        $call_id = $item['call_id'] ?? $item_id;
+                        $fn_name = $item['name'] ?? '';
+                        $t_idx = $next_tool_idx++;
+                        $item_id_to_tool_idx[$item_id] = $t_idx;
+                        $tool_calls_map[$t_idx] = [
+                            'id' => $call_id,
+                            'type' => 'function',
+                            'function' => [
+                                'name' => $fn_name,
+                                'arguments' => ''
+                            ]
+                        ];
+                        if ($is_stream && !$native_responses_mode) {
+                            $out_chunk = [
+                                'id' => $chunk_id,
+                                'object' => 'chat.completion.chunk',
+                                'created' => time(),
+                                'model' => $codex_model,
+                                'choices' => [
+                                    [
+                                        'index' => 0,
+                                        'delta' => [
+                                            'tool_calls' => [
+                                                [
+                                                    'index' => $t_idx,
+                                                    'id' => $call_id,
+                                                    'type' => 'function',
+                                                    'function' => [
+                                                        'name' => $fn_name,
+                                                        'arguments' => ''
+                                                    ]
+                                                ]
+                                            ]
+                                        ],
+                                        'finish_reason' => null
                                     ]
-                                ];
-                                echo "data: " . json_encode($out_chunk) . "\n\n";
-                                @ob_flush();
-                                @flush();
-                            }
-                        } elseif ($ev['type'] === 'response.completed' && isset($ev['response']['usage'])) {
-                            $u = $ev['response']['usage'];
-                            $usage_stats['prompt_tokens'] = intval($u['input_tokens'] ?? 0);
-                            $usage_stats['completion_tokens'] = intval($u['output_tokens'] ?? 0);
-                            $usage_stats['total_tokens'] = intval($u['total_tokens'] ?? ($usage_stats['prompt_tokens'] + $usage_stats['completion_tokens']));
+                                ]
+                            ];
+                            echo "data: " . json_encode($out_chunk) . "\n\n";
+                            @ob_flush();
+                            @flush();
                         }
+                    }
+                } elseif ($ev_type === 'response.function_call_arguments.delta' && isset($ev['delta'])) {
+                    $item_id = $ev['item_id'] ?? '';
+                    $t_idx = $item_id_to_tool_idx[$item_id] ?? 0;
+                    $arg_delta = $ev['delta'];
+                    if (isset($tool_calls_map[$t_idx])) {
+                        $tool_calls_map[$t_idx]['function']['arguments'] .= $arg_delta;
+                    }
+                    if ($is_stream && !$native_responses_mode) {
+                        $out_chunk = [
+                            'id' => $chunk_id,
+                            'object' => 'chat.completion.chunk',
+                            'created' => time(),
+                            'model' => $codex_model,
+                            'choices' => [
+                                [
+                                    'index' => 0,
+                                    'delta' => [
+                                        'tool_calls' => [
+                                            [
+                                                'index' => $t_idx,
+                                                'function' => [
+                                                    'arguments' => $arg_delta
+                                                ]
+                                            ]
+                                        ]
+                                    ],
+                                    'finish_reason' => null
+                                ]
+                            ]
+                        ];
+                        echo "data: " . json_encode($out_chunk) . "\n\n";
+                        @ob_flush();
+                        @flush();
+                    }
+                } elseif ($ev_type === 'response.completed' && isset($ev['response'])) {
+                    $completed_response_obj = $ev['response'];
+                    if (isset($ev['response']['usage'])) {
+                        $u = $ev['response']['usage'];
+                        $usage_stats['prompt_tokens'] = intval($u['input_tokens'] ?? 0);
+                        $usage_stats['completion_tokens'] = intval($u['output_tokens'] ?? 0);
+                        $usage_stats['total_tokens'] = intval($u['total_tokens'] ?? ($usage_stats['prompt_tokens'] + $usage_stats['completion_tokens']));
+                        $usage_stats['cached_tokens'] = intval($u['input_tokens_details']['cached_tokens'] ?? 0);
+                        $usage_stats['reasoning_tokens'] = intval($u['output_tokens_details']['reasoning_tokens'] ?? 0);
                     }
                 }
             }
@@ -975,6 +1479,18 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
     $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $curl_err = curl_error($ch);
     curl_close($ch);
+
+    // If a stale x-codex-turn-state caused a 400/422 error, retry immediately without turn-state
+    if ($http_code !== 200 && $allow_turn_state && !$headers_sent && !empty($cache_key) && !empty($saved_entry)) {
+        save_turn_state($cache_key, '', '');
+        return call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $codex_model, $cache_key, $native_responses_mode, false);
+    }
+
+    // Persist updated x-codex-turn-state and load-balancer affinity cookies for next turn's prompt cache affinity
+    if (!empty($cache_key) && (!empty($live_headers['x-codex-turn-state']) || !empty($live_cookies))) {
+        $cookie_str = !empty($live_cookies) ? implode('; ', array_values($live_cookies)) : '';
+        save_turn_state($cache_key, $live_headers['x-codex-turn-state'] ?? '', $cookie_str);
+    }
 
     $header_quota = null;
     if (isset($live_headers['x-codex-primary-used-percent'])) {
@@ -997,7 +1513,34 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
         ];
     }
 
+    $formatted_usage = [
+        'prompt_tokens' => $usage_stats['prompt_tokens'],
+        'completion_tokens' => $usage_stats['completion_tokens'],
+        'total_tokens' => $usage_stats['total_tokens'],
+        'prompt_tokens_details' => [
+            'cached_tokens' => $usage_stats['cached_tokens']
+        ],
+        'completion_tokens_details' => [
+            'reasoning_tokens' => $usage_stats['reasoning_tokens']
+        ]
+    ];
+
     if ($http_code === 200) {
+        $has_tools = !empty($tool_calls_map);
+        $finish_reason = $has_tools ? 'tool_calls' : 'stop';
+
+        if ($native_responses_mode) {
+            if (!$is_stream) {
+                header('Content-Type: application/json');
+                header("X-Routed-Account: $route_name");
+                header("X-Routed-Model: $codex_model");
+                if (!empty($cache_key)) header("X-Session-Id: $cache_key");
+                if (!empty($live_headers['x-codex-turn-state'])) header("x-codex-turn-state: {$live_headers['x-codex-turn-state']}");
+                echo json_encode($completed_response_obj ?: ['status' => 'completed', 'usage' => $formatted_usage]);
+            }
+            return [true, 200, null, $usage_stats, $header_quota];
+        }
+
         if ($is_stream) {
             $done_chunk = [
                 'id' => $chunk_id,
@@ -1008,10 +1551,10 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                     [
                         'index' => 0,
                         'delta' => new stdClass(),
-                        'finish_reason' => 'stop'
+                        'finish_reason' => $finish_reason
                     ]
                 ],
-                'usage' => $usage_stats
+                'usage' => $formatted_usage
             ];
             echo "data: " . json_encode($done_chunk) . "\n\n";
             echo "data: [DONE]\n\n";
@@ -1021,8 +1564,18 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
             header('Content-Type: application/json');
             header("X-Routed-Account: $route_name");
             header("X-Routed-Model: $codex_model");
+            header("X-Cache-Tokens: {$usage_stats['cached_tokens']}");
+            if (!empty($cache_key)) header("X-Session-Id: $cache_key");
+            if (!empty($live_headers['x-codex-turn-state'])) header("x-codex-turn-state: {$live_headers['x-codex-turn-state']}");
             if ($header_quota) {
                 header("X-Quota-Remaining-Percent: {$header_quota['remaining_percent']}");
+            }
+            $msg_obj = [
+                'role' => 'assistant',
+                'content' => ($has_tools && $full_text === '') ? null : $full_text
+            ];
+            if ($has_tools) {
+                $msg_obj['tool_calls'] = array_values($tool_calls_map);
             }
             echo json_encode([
                 'id' => $chunk_id,
@@ -1032,14 +1585,11 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 'choices' => [
                     [
                         'index' => 0,
-                        'message' => [
-                            'role' => 'assistant',
-                            'content' => $full_text
-                        ],
-                        'finish_reason' => 'stop'
+                        'message' => $msg_obj,
+                        'finish_reason' => $finish_reason
                     ]
                 ],
-                'usage' => $usage_stats
+                'usage' => $formatted_usage
             ]);
         }
         return [true, 200, null, $usage_stats, $header_quota];
@@ -1048,8 +1598,8 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
     return [false, $http_code, $raw_response ?: $curl_err, $usage_stats, $header_quota];
 }
 
-// ---------------- REVERSE PROXY ROUTE WITH AUTO-REFRESH & FAILOVER ----------------
-if (($uri === '/v1/chat/completions' || $uri === '/v1/responses') && $method === 'POST') {
+// ---------------- REVERSE PROXY ROUTE WITH AUTO-REFRESH, PROMPT CACHE & FAILOVER ----------------
+if (($uri === '/v1/chat/completions' || $uri === '/chat/completions' || $uri === '/v1/responses' || $uri === '/responses' || $uri === '/v1/codex/responses') && $method === 'POST') {
     if (!is_authenticated() && !check_proxy_auth()) {
         http_response_code(401);
         echo json_encode(['error' => ['message' => 'Unauthorized. Provide Bearer token or log in.']]);
@@ -1058,7 +1608,9 @@ if (($uri === '/v1/chat/completions' || $uri === '/v1/responses') && $method ===
 
     $raw_body = file_get_contents('php://input');
     $payload = json_decode($raw_body, true) ?: [];
-    $is_stream = !empty($payload['stream']);
+    $is_responses_endpoint = ($uri === '/v1/responses' || $uri === '/responses' || $uri === '/v1/codex/responses');
+    $native_responses_mode = $is_responses_endpoint && isset($payload['input']) && !isset($payload['messages']);
+    $is_stream = isset($payload['stream']) ? !empty($payload['stream']) : $native_responses_mode;
 
     $state = load_state($DATA_FILE);
     clean_cooldowns($state);
@@ -1076,9 +1628,17 @@ if (($uri === '/v1/chat/completions' || $uri === '/v1/responses') && $method ===
         // Route through Codex Rust Backend if this is a ChatGPT OAuth Account
         if ($is_codex_oauth) {
             $codex_model = resolve_codex_model($payload['model'] ?? '', $route['model'] ?? 'gpt-6-luna');
-            $codex_payload = build_codex_payload($payload, $codex_model);
+            list($codex_payload, $cache_key) = build_codex_payload($payload, $codex_model, $route['id']);
 
-            list($ok, $http_code, $err_raw, $usage_stats, $header_quota) = call_codex_backend($api_key, $codex_payload, $is_stream, $route['name'], $codex_model);
+            list($ok, $http_code, $err_raw, $usage_stats, $header_quota) = call_codex_backend(
+                $api_key,
+                $codex_payload,
+                $is_stream,
+                $route['name'],
+                $codex_model,
+                $cache_key,
+                $native_responses_mode
+            );
 
             // Auto-refresh token on 401
             if (!$ok && $http_code === 401 && !empty($route['refresh_token'])) {
@@ -1092,7 +1652,15 @@ if (($uri === '/v1/chat/completions' || $uri === '/v1/responses') && $method ===
                     }
                     save_state($DATA_FILE, $state);
                     $api_key = $new_access;
-                    list($ok, $http_code, $err_raw, $usage_stats, $header_quota) = call_codex_backend($api_key, $codex_payload, $is_stream, $route['name'], $codex_model);
+                    list($ok, $http_code, $err_raw, $usage_stats, $header_quota) = call_codex_backend(
+                        $api_key,
+                        $codex_payload,
+                        $is_stream,
+                        $route['name'],
+                        $codex_model,
+                        $cache_key,
+                        $native_responses_mode
+                    );
                 }
             }
 
@@ -1186,6 +1754,8 @@ function record_outcome(&$state, $id, $success, $code = null, $err = null, $usag
                 $a['prompt_tokens'] = ($a['prompt_tokens'] ?? 0) + intval($usage_stats['prompt_tokens'] ?? 0);
                 $a['completion_tokens'] = ($a['completion_tokens'] ?? 0) + intval($usage_stats['completion_tokens'] ?? 0);
                 $a['total_tokens'] = ($a['total_tokens'] ?? 0) + intval($usage_stats['total_tokens'] ?? 0);
+                $cached = intval($usage_stats['cached_tokens'] ?? ($usage_stats['prompt_tokens_details']['cached_tokens'] ?? 0));
+                $a['cached_tokens'] = ($a['cached_tokens'] ?? 0) + $cached;
             }
             if (is_array($quota_update)) {
                 $a['quota'] = array_merge($a['quota'] ?? [], $quota_update);
@@ -1854,22 +2424,26 @@ function handle_mock_streaming($route, $payload) {
       </div>
     </div>
 
-    <!-- Live SSE Streaming Console -->
+    <!-- Multi-Turn Back-and-Forth Streaming & Prompt Cache Console -->
     <div class="card">
       <div class="card-head">
-        <div class="card-title">Live SSE Streaming Console</div>
-        <div style="font-size: 12px; color: var(--text-muted);">
-          <span id="streamAccountInfo">Route: -</span> | <span id="streamStats">0 tokens</span>
+        <div class="card-title">
+          <span>Back-and-Forth Codex Streaming & Prompt Cache Console</span>
+          <span id="cacheBadge" class="pill pill-oauth" style="font-size:10px;">KV Cache Active</span>
+        </div>
+        <div style="font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 10px;">
+          <span id="streamAccountInfo">Route: -</span> | <span id="streamStats">Turn 0 • 0 tokens</span>
+          <button class="btn btn-sm" onclick="resetChatSession()">Reset Session</button>
         </div>
       </div>
       <div class="card-body">
-        <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-          <input type="text" id="testPrompt" style="flex: 1;" value="Count from 1 to 5 with short cheerful cheer for each number." />
+        <div class="stream-box" id="streamOutput" style="margin-bottom: 12px; min-height: 200px;">Send a message below to stream back-and-forth with Codex (`gpt-6-luna`) using persistent `x-codex-turn-state` + `prompt_cache_key` KV caching...</div>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" id="testPrompt" style="flex: 1;" placeholder="Type a message and press Enter to stream back-and-forth..." value="Remember the secret codeword: AURORA-7. Confirm in one short sentence." onkeydown="if(event.key==='Enter') runStreamingTest()" />
           <button class="btn btn-primary" id="streamBtn" onclick="runStreamingTest()">
-            Stream
+            Send & Stream
           </button>
         </div>
-        <div class="stream-box" id="streamOutput">Click "Stream" to test real-time SSE token delivery through tokenswitch.zipperi.com...</div>
       </div>
     </div>
   </div>
@@ -2067,13 +2641,14 @@ function handle_mock_streaming($route, $payload) {
 
         const q = data.route.quota;
         const totTok = Number(data.route.total_tokens || 0).toLocaleString();
+        const cachedTok = Number(data.route.cached_tokens || 0).toLocaleString();
         const quotaEl = document.getElementById('exportQuota');
         if (q && typeof q.remaining_percent !== 'undefined') {
           const plan = String(q.plan_type || 'free').toUpperCase();
-          quotaEl.innerText = `${q.remaining_percent}% Left (${plan}) • ${totTok} tok`;
+          quotaEl.innerText = `${q.remaining_percent}% Left (${plan}) • ${totTok} tok (${cachedTok} cached)`;
           quotaEl.style.color = q.remaining_percent > 30 ? '#3fb950' : (q.remaining_percent > 10 ? '#e3b341' : '#f85149');
         } else {
-          quotaEl.innerText = `${totTok} tokens used`;
+          quotaEl.innerText = `${totTok} tok (${cachedTok} cached)`;
           quotaEl.style.color = '#ff9d66';
         }
 
@@ -2094,16 +2669,16 @@ function handle_mock_streaming($route, $payload) {
       else if (activeTab === 'bash') el.innerText = currentExportData.bash_export;
       else if (activeTab === 'powershell') el.innerText = currentExportData.powershell_export;
       else if (activeTab === 'cpanel') {
-        el.innerText = `# Route any LLM tool directly through tokenswitch.zipperi.com
+        el.innerText = `# Route any LLM tool or Codex agent directly through tokenswitch.zipperi.com
 OPENAI_BASE_URL="https://tokenswitch.zipperi.com/v1"
 OPENAI_API_KEY="Its.me@12345"
 OPENAI_MODEL="${currentExportData.route.model}"
 
-# Test via curl:
+# Supports both /v1/chat/completions AND native /v1/responses with automatic KV caching:
 curl https://tokenswitch.zipperi.com/v1/chat/completions \\
   -H "Authorization: Bearer Its.me@12345" \\
   -H "Content-Type: application/json" \\
-  -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":true}'`;
+  -d '{"model":"gpt-6-luna","messages":[{"role":"user","content":"Hello!"}],"stream":true}'`;
       }
     }
 
@@ -2146,7 +2721,8 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
         const totalTok = Number(acc.total_tokens || 0).toLocaleString();
         const inTok = Number(acc.prompt_tokens || 0).toLocaleString();
         const outTok = Number(acc.completion_tokens || 0).toLocaleString();
-        const tokLine = `<div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono); margin-top:3px;">${totalTok} tok <span style="color:var(--text-dim);">(${inTok} in / ${outTok} out)</span></div>`;
+        const cachedTok = Number(acc.cached_tokens || 0).toLocaleString();
+        const tokLine = `<div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono); margin-top:3px;">${totalTok} tok <span style="color:var(--text-dim);">(${inTok} in / ${outTok} out)</span><br/><span style="color:#3fb950;">⚡ ${cachedTok} cached</span></div>`;
 
         let quotaHtml = '';
         if (acc.quota && typeof acc.quota.remaining_percent !== 'undefined') {
@@ -2370,8 +2946,22 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
       fetchStatus();
     }
 
+    let chatHistory = [];
+    let chatSessionId = 'ts-session-' + Math.random().toString(36).substring(2, 10);
+    let turnNumber = 0;
+
+    function resetChatSession() {
+      chatHistory = [];
+      chatSessionId = 'ts-session-' + Math.random().toString(36).substring(2, 10);
+      turnNumber = 0;
+      document.getElementById('streamOutput').innerText = 'Session reset! Send a message below to start a new multi-turn cached Codex stream...';
+      document.getElementById('streamStats').innerText = 'Turn 0 • 0 tokens';
+      document.getElementById('testPrompt').value = 'Remember the secret codeword: AURORA-7. Confirm in one short sentence.';
+    }
+
     async function runStreamingTest() {
-      const prompt = document.getElementById('testPrompt').value.trim();
+      const inputEl = document.getElementById('testPrompt');
+      const prompt = inputEl.value.trim();
       if (!prompt) return;
 
       const outputEl = document.getElementById('streamOutput');
@@ -2379,18 +2969,35 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
       const statsEl = document.getElementById('streamStats');
       const btn = document.getElementById('streamBtn');
 
-      outputEl.innerText = '';
+      if (turnNumber === 0) {
+        outputEl.innerText = '';
+        // Include a >1,200 token system prompt so OpenAI's 1024-token prefix KV cache engages on Turn 2+
+        const sysContext = 'You are an advanced autonomous coding assistant running on the OpenAI Codex Rust backend through TokenSwitch. Maintain full multi-turn context and respond concisely and accurately. '.repeat(55);
+        chatHistory.push({ role: 'system', content: sysContext });
+      }
+
+      turnNumber++;
+      chatHistory.push({ role: 'user', content: prompt });
+      inputEl.value = '';
+      outputEl.innerText += (outputEl.innerText ? '\n\n' : '') + `[You (Turn ${turnNumber})]: ${prompt}\n[Codex]: `;
+      outputEl.scrollTop = outputEl.scrollHeight;
       btn.disabled = true;
 
       const startTime = performance.now();
       let tokenCount = 0;
+      let assistantReply = '';
+      let usageInfo = null;
 
       try {
         const response = await fetch('/v1/chat/completions', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Id': chatSessionId
+          },
           body: JSON.stringify({
-            messages: [{ role: 'user', content: prompt }],
+            prompt_cache_key: chatSessionId,
+            messages: chatHistory,
             stream: true
           })
         });
@@ -2418,17 +3025,31 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
             if (trimmed.startsWith('data: ')) {
               try {
                 const chunk = JSON.parse(trimmed.substring(6));
+                if (chunk.usage) {
+                  usageInfo = chunk.usage;
+                }
                 const text = chunk.choices?.[0]?.delta?.content || '';
                 if (text) {
+                  assistantReply += text;
                   outputEl.innerText += text;
                   tokenCount++;
                   outputEl.scrollTop = outputEl.scrollHeight;
                   const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
-                  statsEl.innerText = `${tokenCount} chunks (${elapsed}s)`;
+                  statsEl.innerText = `Turn ${turnNumber} • ${tokenCount} chunks (${elapsed}s)`;
                 }
               } catch (e) { }
             }
           }
+        }
+
+        chatHistory.push({ role: 'assistant', content: assistantReply });
+        if (usageInfo) {
+          const cached = usageInfo.prompt_tokens_details?.cached_tokens || 0;
+          const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+          statsEl.innerText = `Turn ${turnNumber} • ${usageInfo.prompt_tokens} in (⚡ ${cached} cached) / ${usageInfo.completion_tokens} out (${elapsed}s)`;
+        }
+        if (turnNumber === 1) {
+          inputEl.value = 'What was the secret codeword I just told you?';
         }
       } catch (err) {
         outputEl.innerText += `\n[Stream Error]: ${err.message}`;
