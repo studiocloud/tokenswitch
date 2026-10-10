@@ -79,6 +79,13 @@ Instead, TokenSwitch routes `chatgpt_oauth` accounts through the internal Codex 
   - `gpt-5.5`
   - `gpt-reserve`
   - `codex-auto-review`
+- **Full Reasoning Effort Modes (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`)**:
+  - Clients can specify any of the 6 reasoning effort levels (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) in any of the following ways (in priority order):
+    1. **Request Body**: `"reasoning_effort": "xhigh"`, `"reasoning": {"effort": "max"}`, `"effort": "high"`, or `"thinking": {"effort": "low"}`.
+    2. **Model Suffix / Alias**: Set `model` to `gpt-6-luna-minimal`, `gpt-6-luna-low`, `gpt-6-luna-medium`, `gpt-6-luna-high`, `gpt-6-luna-xhigh`, or `gpt-6-luna-max` (also supports `:`, `@`, or `/` separators such as `gpt-6-luna:xhigh`).
+    3. **Base URL Path / Query / Header**: Use Base URL `https://tokenswitch.zipperi.com/v1/xhigh` (calling `/v1/{effort}/chat/completions` or `/v1/{effort}/responses`), query param `?reasoning_effort=max`, or HTTP header `X-Reasoning-Effort: high`.
+    4. **Per-Account Dashboard Default**: Set the default reasoning mode per account on the TokenSwitch dashboard (`POST /api/accounts/{id}/reasoning`).
+  - **Upstream Normalization**: When `minimal` is requested, TokenSwitch automatically translates it to Codex's upstream `'none'` mode (since `gpt-6-luna` rejects the literal string `'minimal'`) and exposes `X-Reasoning-Effort: minimal` in the response headers.
 - **Multi-Turn Back-and-Forth & Agentic Tool Translation**:
   - Incoming OpenAI `messages` (`system`, `developer`, `user`, `assistant`, `assistant.tool_calls`, and `role: "tool"` outputs) are converted into Codex `instructions`, `message`, `function_call`, and `function_call_output` items.
   - Incoming OpenAI `tools` (`type: "function"`) are automatically converted to Codex `tools` definitions, and upstream `response.output_item.added` (`function_call`) + `response.function_call_arguments.delta` SSE frames are streamed back as standard OpenAI `choices[0].delta.tool_calls` with `finish_reason: "tool_calls"`.
@@ -102,15 +109,17 @@ Configure your environment variables or OpenAI client to point to TokenSwitch:
 OPENAI_BASE_URL="https://tokenswitch.zipperi.com/v1"
 OPENAI_API_KEY="Its.me@12345"
 OPENAI_MODEL="gpt-6-luna"
+OPENAI_REASONING_EFFORT="medium" # minimal | low | medium | high | xhigh | max
 ```
 
-### cURL Example (Streaming)
+### cURL Example (Streaming + Reasoning Mode)
 ```bash
 curl https://tokenswitch.zipperi.com/v1/chat/completions \
   -H "Authorization: Bearer Its.me@12345" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-6-luna",
+    "reasoning_effort": "xhigh",
     "messages": [
       {"role": "user", "content": "Write a fast binary search in Rust."}
     ],
@@ -129,6 +138,7 @@ client = OpenAI(
 
 stream = client.chat.completions.create(
     model="gpt-6-luna",
+    reasoning_effort="high",  # minimal | low | medium | high | xhigh | max
     messages=[{"role": "user", "content": "Hello from Python!"}],
     stream=True,
 )

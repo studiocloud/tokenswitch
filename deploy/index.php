@@ -65,8 +65,8 @@ $method = $_SERVER['REQUEST_METHOD'];
 // Global CORS & Preflight support for IDE extensions, SDKs, and Codex clients
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Authorization, Content-Type, Accept, OpenAI-Beta, originator, session_id, x-codex-turn-state, x-session-id, x-prompt-cache-key, User-Agent');
-header('Access-Control-Expose-Headers: X-Routed-Account, X-Routed-Model, X-Quota-Remaining-Percent, X-Cache-Tokens, X-Session-Id, x-codex-turn-state, x-models-etag');
+header('Access-Control-Allow-Headers: Authorization, Content-Type, Accept, OpenAI-Beta, originator, session_id, x-codex-turn-state, x-session-id, x-prompt-cache-key, X-Reasoning-Effort, x-codex-reasoning-effort, User-Agent');
+header('Access-Control-Expose-Headers: X-Routed-Account, X-Routed-Model, X-Reasoning-Effort, X-Quota-Remaining-Percent, X-Cache-Tokens, X-Session-Id, x-codex-turn-state, x-models-etag');
 if ($method === 'OPTIONS') {
     http_response_code(204);
     exit;
@@ -381,6 +381,7 @@ if ($uri === '/api/status' && $method === 'GET') {
             'api_key' => $acc['api_key'],
             'has_refresh_token' => !empty($acc['refresh_token']),
             'model' => $acc['model'],
+            'reasoning_effort' => $acc['reasoning_effort'] ?? 'medium',
             'priority' => $acc['priority'] ?? 1,
             'cooldown_secs' => $acc['cooldown_secs'] ?? 60,
             'enabled' => !empty($acc['enabled']),
@@ -395,6 +396,7 @@ if ($uri === '/api/status' && $method === 'GET') {
             'prompt_tokens' => $acc['prompt_tokens'] ?? 0,
             'completion_tokens' => $acc['completion_tokens'] ?? 0,
             'cached_tokens' => $acc['cached_tokens'] ?? 0,
+            'reasoning_tokens' => $acc['reasoning_tokens'] ?? 0,
             'quota' => $acc['quota'] ?? null,
             'last_error' => $acc['last_error'] ?? null,
             'is_active_route' => ($acc['id'] === $active_id)
@@ -428,26 +430,31 @@ if ($uri === '/api/export' && $method === 'GET') {
 
     $proxy_base = "https://tokenswitch.zipperi.com/v1";
     $proxy_key = AUTH_PASSWORD;
+    $eff = $route['reasoning_effort'] ?? 'medium';
 
-    $env = "OPENAI_BASE_URL=\"{$proxy_base}\"\nOPENAI_API_KEY=\"{$proxy_key}\"\nOPENAI_MODEL=\"{$route['model']}\"";
+    $env = "OPENAI_BASE_URL=\"{$proxy_base}\"\nOPENAI_API_KEY=\"{$proxy_key}\"\nOPENAI_MODEL=\"{$route['model']}\"\nOPENAI_REASONING_EFFORT=\"{$eff}\"";
     $json = json_encode([
         'base_url' => $proxy_base,
         'api_key' => $proxy_key,
         'model' => $route['model'],
+        'reasoning_effort' => $eff,
+        'supported_reasoning_efforts' => ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
         'id' => $route['id'],
         'name' => $route['name'],
         'auth_type' => $route['auth_type'] ?? 'api_key',
         'upstream_token' => $route['api_key'],
         'quota' => $route['quota'] ?? null,
         'total_tokens' => $route['total_tokens'] ?? 0,
-        'cached_tokens' => $route['cached_tokens'] ?? 0
+        'cached_tokens' => $route['cached_tokens'] ?? 0,
+        'reasoning_tokens' => $route['reasoning_tokens'] ?? 0
     ], JSON_PRETTY_PRINT);
-    $bash = "export OPENAI_BASE_URL=\"{$proxy_base}\"\nexport OPENAI_API_KEY=\"{$proxy_key}\"\nexport OPENAI_MODEL=\"{$route['model']}\"";
-    $powershell = "\$env:OPENAI_BASE_URL=\"{$proxy_base}\"\n\$env:OPENAI_API_KEY=\"{$proxy_key}\"\n\$env:OPENAI_MODEL=\"{$route['model']}\"";
+    $bash = "export OPENAI_BASE_URL=\"{$proxy_base}\"\nexport OPENAI_API_KEY=\"{$proxy_key}\"\nexport OPENAI_MODEL=\"{$route['model']}\"\nexport OPENAI_REASONING_EFFORT=\"{$eff}\"";
+    $powershell = "\$env:OPENAI_BASE_URL=\"{$proxy_base}\"\n\$env:OPENAI_API_KEY=\"{$proxy_key}\"\n\$env:OPENAI_MODEL=\"{$route['model']}\"\n\$env:OPENAI_REASONING_EFFORT=\"{$eff}\"";
 
     $export_route = $route;
     $export_route['base_url'] = $proxy_base;
     $export_route['proxy_key'] = $proxy_key;
+    $export_route['reasoning_effort'] = $eff;
 
     echo json_encode([
         'route' => $export_route,
@@ -748,6 +755,32 @@ if (preg_match('#^/api/accounts/([^/]+)/model$#', $uri, $m) && $method === 'POST
     exit;
 }
 
+if (preg_match('#^/api/accounts/([^/]+)/reasoning$#', $uri, $m) && $method === 'POST') {
+    if (!is_authenticated() && !check_proxy_auth()) {
+        http_response_code(401);
+        exit;
+    }
+    $id = $m[1];
+    $input = json_decode(file_get_contents('php://input'), true);
+    $new_effort = strtolower(trim($input['reasoning_effort'] ?? ($input['effort'] ?? 'medium')));
+    $allowed_efforts = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+    if (!in_array($new_effort, $allowed_efforts, true)) {
+        http_response_code(400);
+        echo json_encode(['status' => 'error', 'message' => 'Invalid reasoning_effort. Allowed: minimal, low, medium, high, xhigh, max']);
+        exit;
+    }
+    $state = load_state($DATA_FILE);
+    foreach ($state['accounts'] as &$a) {
+        if ($a['id'] === $id) {
+            $a['reasoning_effort'] = $new_effort;
+            break;
+        }
+    }
+    save_state($DATA_FILE, $state);
+    echo json_encode(['status' => 'ok', 'reasoning_effort' => $new_effort]);
+    exit;
+}
+
 if ($uri === '/api/switch' && $method === 'POST') {
     if (!is_authenticated()) {
         http_response_code(401);
@@ -801,7 +834,7 @@ if ($uri === '/api/report' && $method === 'POST') {
 }
 
 // ---------------- MODEL DISCOVERY ENDPOINT (/v1/models) ----------------
-if (($uri === '/v1/models' || $uri === '/models' || $uri === '/v1/codex/models' || preg_match('#^/v1/models/([^/]+)$#', $uri)) && $method === 'GET') {
+if (($uri === '/v1/models' || $uri === '/models' || $uri === '/v1/codex/models' || preg_match('#^/v1/(?:minimal|low|medium|high|xhigh|max)/models$#i', $uri) || preg_match('#^/v1/models/([^/]+)$#', $uri)) && $method === 'GET') {
     if (!is_authenticated() && !check_proxy_auth()) {
         http_response_code(401);
         echo json_encode(['error' => ['message' => 'Unauthorized. Provide Bearer token or log in.']]);
@@ -834,6 +867,36 @@ if (($uri === '/v1/models' || $uri === '/models' || $uri === '/v1/codex/models' 
             $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_close($ch);
             if ($code === 200 && !empty($res)) {
+                $catalog = json_decode($res, true);
+                if (is_array($catalog) && isset($catalog['models']) && is_array($catalog['models'])) {
+                    $default_eff = $route['reasoning_effort'] ?? 'medium';
+                    foreach ($catalog['models'] as &$cm) {
+                        $cm['default_reasoning_level'] = $default_eff;
+                        $levels = $cm['supported_reasoning_levels'] ?? [];
+                        $has_minimal = false;
+                        $has_max = false;
+                        foreach ($levels as $lv) {
+                            if (($lv['effort'] ?? '') === 'minimal') $has_minimal = true;
+                            if (($lv['effort'] ?? '') === 'max') $has_max = true;
+                        }
+                        if (!$has_minimal) {
+                            array_unshift($levels, [
+                                'effort' => 'minimal',
+                                'description' => 'Minimal reasoning for fastest responses and lowest latency'
+                            ]);
+                        }
+                        if (!$has_max) {
+                            $levels[] = [
+                                'effort' => 'max',
+                                'description' => 'Maximum reasoning depth for complex problems'
+                            ];
+                        }
+                        $cm['supported_reasoning_levels'] = $levels;
+                    }
+                    header('Content-Type: application/json');
+                    echo json_encode($catalog);
+                    exit;
+                }
                 header('Content-Type: application/json');
                 echo $res;
                 exit;
@@ -843,6 +906,12 @@ if (($uri === '/v1/models' || $uri === '/models' || $uri === '/v1/codex/models' 
 
     $models = [
         'gpt-6-luna',
+        'gpt-6-luna-minimal',
+        'gpt-6-luna-low',
+        'gpt-6-luna-medium',
+        'gpt-6-luna-high',
+        'gpt-6-luna-xhigh',
+        'gpt-6-luna-max',
         'gpt-5.6-luna',
         'gpt-5.6-terra',
         'gpt-5.5',
@@ -861,7 +930,8 @@ if (($uri === '/v1/models' || $uri === '/models' || $uri === '/v1/codex/models' 
             'id' => $req_m,
             'object' => 'model',
             'created' => 1770000000,
-            'owned_by' => 'openai-codex-tokenswitch'
+            'owned_by' => 'openai-codex-tokenswitch',
+            'supported_reasoning_efforts' => ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
         ]);
         exit;
     }
@@ -870,7 +940,8 @@ if (($uri === '/v1/models' || $uri === '/models' || $uri === '/v1/codex/models' 
         'id' => $m,
         'object' => 'model',
         'created' => 1770000000,
-        'owned_by' => 'openai-codex-tokenswitch'
+        'owned_by' => 'openai-codex-tokenswitch',
+        'supported_reasoning_efforts' => ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
     ], $models);
 
     header('Content-Type: application/json');
@@ -943,6 +1014,23 @@ function save_turn_state($cache_key, $turn_state, $cookies = '') {
     @file_put_contents($TURN_STATE_FILE, json_encode($map), LOCK_EX);
 }
 
+// Parse model name + optional reasoning suffix (e.g. gpt-6-luna-xhigh, gpt-6-luna:max, etc.)
+function parse_model_and_effort_suffix($model_str) {
+    $model_str = trim((string)$model_str);
+    if ($model_str === '') return ['', null];
+    $lower = strtolower($model_str);
+    if (in_array($lower, ['minimal', 'none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'], true)) {
+        return ['', $lower === 'none' ? 'minimal' : $lower];
+    }
+    if (preg_match('/^(.+?)[\-:@\/](minimal|none|low|medium|high|xhigh|max|ultra)$/i', $model_str, $m)) {
+        $base = trim($m[1]);
+        $eff = strtolower($m[2]);
+        if ($eff === 'none') $eff = 'minimal';
+        return [$base, $eff];
+    }
+    return [$model_str, null];
+}
+
 // Map standard model names to valid Codex backend slugs
 function resolve_codex_model($requested_model, $route_model) {
     $valid_codex_models = [
@@ -953,13 +1041,114 @@ function resolve_codex_model($requested_model, $route_model) {
         'gpt-5.5',
         'codex-auto-review'
     ];
-    if (!empty($requested_model) && in_array($requested_model, $valid_codex_models, true)) {
-        return $requested_model;
+    list($req_base, $_) = parse_model_and_effort_suffix($requested_model);
+    list($route_base, $_) = parse_model_and_effort_suffix($route_model);
+    if (!empty($req_base) && in_array($req_base, $valid_codex_models, true)) {
+        return $req_base;
     }
-    if (!empty($route_model) && in_array($route_model, $valid_codex_models, true)) {
-        return $route_model;
+    if (!empty($route_base) && in_array($route_base, $valid_codex_models, true)) {
+        return $route_base;
     }
     return 'gpt-6-luna';
+}
+
+// Resolve user's requested reasoning effort (minimal, low, medium, high, xhigh, max) & map to Codex backend value
+function resolve_codex_reasoning($payload, $codex_model, $route_default_effort = 'medium', $uri_effort = null) {
+    // 1. Check explicit payload fields (OpenAI chat completions reasoning_effort, Responses reasoning.effort, effort, thinking.effort)
+    $raw_effort = null;
+    $summary = 'auto';
+
+    if (isset($payload['reasoning']) && is_array($payload['reasoning'])) {
+        if (!empty($payload['reasoning']['effort'])) {
+            $raw_effort = $payload['reasoning']['effort'];
+        }
+        if (isset($payload['reasoning']['summary'])) {
+            $summary = $payload['reasoning']['summary'];
+        }
+    } elseif (isset($payload['reasoning']) && is_string($payload['reasoning']) && $payload['reasoning'] !== '') {
+        $raw_effort = $payload['reasoning'];
+    }
+
+    if ($raw_effort === null && !empty($payload['reasoning_effort']) && is_string($payload['reasoning_effort'])) {
+        $raw_effort = $payload['reasoning_effort'];
+    }
+    if ($raw_effort === null && !empty($payload['effort']) && is_string($payload['effort'])) {
+        $raw_effort = $payload['effort'];
+    }
+    if ($raw_effort === null && !empty($payload['thinking']['effort']) && is_string($payload['thinking']['effort'])) {
+        $raw_effort = $payload['thinking']['effort'];
+    }
+
+    // 2. Check model suffix (e.g., gpt-6-luna-xhigh or gpt-6-luna:minimal)
+    if ($raw_effort === null && !empty($payload['model'])) {
+        list($_, $model_eff) = parse_model_and_effort_suffix($payload['model']);
+        if ($model_eff !== null) {
+            $raw_effort = $model_eff;
+        }
+    }
+
+    // 3. Check URL path / query parameter / HTTP headers
+    if ($raw_effort === null && !empty($uri_effort)) {
+        $raw_effort = $uri_effort;
+    }
+    if ($raw_effort === null && !empty($_GET['reasoning_effort'])) {
+        $raw_effort = $_GET['reasoning_effort'];
+    }
+    if ($raw_effort === null && !empty($_GET['effort'])) {
+        $raw_effort = $_GET['effort'];
+    }
+    if ($raw_effort === null && !empty($_SERVER['HTTP_X_REASONING_EFFORT'])) {
+        $raw_effort = $_SERVER['HTTP_X_REASONING_EFFORT'];
+    }
+    if ($raw_effort === null && !empty($_SERVER['HTTP_X_CODEX_REASONING_EFFORT'])) {
+        $raw_effort = $_SERVER['HTTP_X_CODEX_REASONING_EFFORT'];
+    }
+
+    // 4. Fallback to account's configured reasoning_effort (or model suffix on account model)
+    if ($raw_effort === null) {
+        $raw_effort = !empty($route_default_effort) ? $route_default_effort : 'medium';
+    }
+
+    $norm = strtolower(trim((string)$raw_effort));
+    $aliases = [
+        'min' => 'minimal',
+        'none' => 'minimal',
+        'off' => 'minimal',
+        'fast' => 'minimal',
+        'minimal' => 'minimal',
+        'low' => 'low',
+        'med' => 'medium',
+        'medium' => 'medium',
+        'high' => 'high',
+        'xhigh' => 'xhigh',
+        'x-high' => 'xhigh',
+        'extra_high' => 'xhigh',
+        'extra-high' => 'xhigh',
+        'max' => 'max',
+        'maximum' => 'max',
+        'ultra' => 'max'
+    ];
+    $user_effort = $aliases[$norm] ?? 'medium';
+
+    // Map user-facing effort to exact upstream Codex backend effort for this model:
+    // Upstream gpt-6-luna / gpt-5.6-luna / gpt-5.6-terra / gpt-5.5 accept 'none' for minimal thinking,
+    // and reject the literal word 'minimal'.
+    if ($user_effort === 'minimal') {
+        $upstream_effort = 'none';
+    } elseif ($user_effort === 'max' && $codex_model === 'gpt-5.5') {
+        $upstream_effort = 'xhigh';
+    } elseif ($norm === 'ultra' && $codex_model === 'gpt-5.6-terra') {
+        $upstream_effort = 'ultra';
+    } else {
+        $upstream_effort = $user_effort;
+    }
+
+    $reasoning_obj = ['effort' => $upstream_effort];
+    if (!empty($summary)) {
+        $reasoning_obj['summary'] = $summary;
+    }
+
+    return [$reasoning_obj, $user_effort];
 }
 
 // Extract text helper from message content
@@ -981,8 +1170,10 @@ function extract_message_text($content_raw) {
     return '';
 }
 
-// Convert OpenAI Chat Completions OR Native Responses payload into Codex Responses payload + cache key
-function build_codex_payload($payload, $codex_model, $route_id = 'default') {
+// Convert OpenAI Chat Completions OR Native Responses payload into Codex Responses payload + cache key + reasoning mode
+function build_codex_payload($payload, $codex_model, $route_id = 'default', $route_default_effort = 'medium', $uri_effort = null) {
+    list($reasoning_obj, $user_effort) = resolve_codex_reasoning($payload, $codex_model, $route_default_effort, $uri_effort);
+
     // 1. Check if payload is already in Native Responses API format (has 'input' and not 'messages')
     if (isset($payload['input']) && !isset($payload['messages'])) {
         $codex_payload = $payload;
@@ -999,6 +1190,7 @@ function build_codex_payload($payload, $codex_model, $route_id = 'default') {
                 ]
             ];
         }
+        $codex_payload['reasoning'] = $reasoning_obj;
         $codex_payload['store'] = false;
         $codex_payload['stream'] = true;
 
@@ -1020,8 +1212,19 @@ function build_codex_payload($payload, $codex_model, $route_id = 'default') {
             : format_uuid_from_seed($route_id . '|' . $codex_payload['instructions'] . '|' . substr($first_user, 0, 512));
 
         $codex_payload['prompt_cache_key'] = $cache_key;
-        unset($codex_payload['max_tokens'], $codex_payload['max_completion_tokens'], $codex_payload['temperature'], $codex_payload['top_p'], $codex_payload['stream_options'], $codex_payload['user'], $codex_payload['session_id']);
-        return [$codex_payload, $cache_key];
+        unset(
+            $codex_payload['max_tokens'],
+            $codex_payload['max_completion_tokens'],
+            $codex_payload['temperature'],
+            $codex_payload['top_p'],
+            $codex_payload['stream_options'],
+            $codex_payload['user'],
+            $codex_payload['session_id'],
+            $codex_payload['reasoning_effort'],
+            $codex_payload['effort'],
+            $codex_payload['thinking']
+        );
+        return [$codex_payload, $cache_key, $user_effort];
     }
 
     // 2. Standard Chat Completions format -> Full bidirectional Codex Responses translation
@@ -1184,18 +1387,16 @@ function build_codex_payload($payload, $codex_model, $route_id = 'default') {
         'tools' => $codex_tools,
         'tool_choice' => $tool_choice,
         'parallel_tool_calls' => $parallel_tool_calls,
+        'reasoning' => $reasoning_obj,
         'store' => false,
         'stream' => true
     ];
-    if (!empty($payload['reasoning'])) {
-        $codex_payload['reasoning'] = $payload['reasoning'];
-    }
 
-    return [$codex_payload, $cache_key];
+    return [$codex_payload, $cache_key, $user_effort];
 }
 
 // Execute Codex Backend Request (Supports both Chat Completions translation & Native Responses pass-through)
-function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $codex_model, $cache_key = null, $native_responses_mode = false, $allow_turn_state = true) {
+function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $codex_model, $cache_key = null, $native_responses_mode = false, $user_effort = 'medium', $allow_turn_state = true) {
     $claims = extract_jwt_claims($api_key);
     $chatgpt_acc_id = $claims['https://api.openai.com/auth']['chatgpt_account_id'] ?? '';
 
@@ -1224,6 +1425,8 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
     $ch = curl_init('https://chatgpt.com/backend-api/codex/responses');
     $raw_response = '';
     $full_text = '';
+    $full_reasoning = '';
+    $sse_error_msg = null;
     $headers_sent = false;
     $chunk_id = 'chatcmpl-' . bin2hex(random_bytes(6));
     $live_headers = [];
@@ -1270,6 +1473,8 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
         CURLOPT_WRITEFUNCTION => function($ch, $data) use (
             &$raw_response,
             &$full_text,
+            &$full_reasoning,
+            &$sse_error_msg,
             &$headers_sent,
             &$usage_stats,
             &$live_headers,
@@ -1282,7 +1487,8 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
             $codex_model,
             $chunk_id,
             $cache_key,
-            $native_responses_mode
+            $native_responses_mode,
+            $user_effort
         ) {
             $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             if ($http_code !== 200) {
@@ -1297,6 +1503,7 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 header('X-Accel-Buffering: no');
                 header("X-Routed-Account: $route_name");
                 header("X-Routed-Model: $codex_model");
+                header("X-Reasoning-Effort: $user_effort");
                 if (!empty($cache_key)) {
                     header("X-Session-Id: $cache_key");
                 }
@@ -1359,6 +1566,7 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                         @flush();
                     }
                 } elseif ($ev_type === 'response.reasoning_summary_text.delta' && isset($ev['delta'])) {
+                    $full_reasoning .= $ev['delta'];
                     if ($is_stream && !$native_responses_mode) {
                         $out_chunk = [
                             'id' => $chunk_id,
@@ -1468,6 +1676,8 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                         $usage_stats['cached_tokens'] = intval($u['input_tokens_details']['cached_tokens'] ?? 0);
                         $usage_stats['reasoning_tokens'] = intval($u['output_tokens_details']['reasoning_tokens'] ?? 0);
                     }
+                } elseif ($ev_type === 'error' && isset($ev['error'])) {
+                    $sse_error_msg = $ev['error']['message'] ?? json_encode($ev['error']);
                 }
             }
 
@@ -1483,7 +1693,7 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
     // If a stale x-codex-turn-state caused a 400/422 error, retry immediately without turn-state
     if ($http_code !== 200 && $allow_turn_state && !$headers_sent && !empty($cache_key) && !empty($saved_entry)) {
         save_turn_state($cache_key, '', '');
-        return call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $codex_model, $cache_key, $native_responses_mode, false);
+        return call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $codex_model, $cache_key, $native_responses_mode, $user_effort, false);
     }
 
     // Persist updated x-codex-turn-state and load-balancer affinity cookies for next turn's prompt cache affinity
@@ -1534,6 +1744,7 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 header('Content-Type: application/json');
                 header("X-Routed-Account: $route_name");
                 header("X-Routed-Model: $codex_model");
+                header("X-Reasoning-Effort: $user_effort");
                 if (!empty($cache_key)) header("X-Session-Id: $cache_key");
                 if (!empty($live_headers['x-codex-turn-state'])) header("x-codex-turn-state: {$live_headers['x-codex-turn-state']}");
                 echo json_encode($completed_response_obj ?: ['status' => 'completed', 'usage' => $formatted_usage]);
@@ -1564,6 +1775,7 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
             header('Content-Type: application/json');
             header("X-Routed-Account: $route_name");
             header("X-Routed-Model: $codex_model");
+            header("X-Reasoning-Effort: $user_effort");
             header("X-Cache-Tokens: {$usage_stats['cached_tokens']}");
             if (!empty($cache_key)) header("X-Session-Id: $cache_key");
             if (!empty($live_headers['x-codex-turn-state'])) header("x-codex-turn-state: {$live_headers['x-codex-turn-state']}");
@@ -1574,6 +1786,9 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 'role' => 'assistant',
                 'content' => ($has_tools && $full_text === '') ? null : $full_text
             ];
+            if ($full_reasoning !== '') {
+                $msg_obj['reasoning_content'] = $full_reasoning;
+            }
             if ($has_tools) {
                 $msg_obj['tool_calls'] = array_values($tool_calls_map);
             }
@@ -1582,6 +1797,7 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 'object' => 'chat.completion',
                 'created' => time(),
                 'model' => $codex_model,
+                'reasoning_effort' => $user_effort,
                 'choices' => [
                     [
                         'index' => 0,
@@ -1595,11 +1811,25 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
         return [true, 200, null, $usage_stats, $header_quota];
     }
 
-    return [false, $http_code, $raw_response ?: $curl_err, $usage_stats, $header_quota];
+    return [false, $http_code, $raw_response ?: ($sse_error_msg ?: $curl_err), $usage_stats, $header_quota];
 }
 
-// ---------------- REVERSE PROXY ROUTE WITH AUTO-REFRESH, PROMPT CACHE & FAILOVER ----------------
-if (($uri === '/v1/chat/completions' || $uri === '/chat/completions' || $uri === '/v1/responses' || $uri === '/responses' || $uri === '/v1/codex/responses') && $method === 'POST') {
+// ---------------- REVERSE PROXY ROUTE WITH AUTO-REFRESH, PROMPT CACHE, REASONING MODES & FAILOVER ----------------
+$uri_reasoning_override = null;
+$is_proxy_post = false;
+$is_responses_endpoint = false;
+if ($method === 'POST') {
+    if ($uri === '/v1/chat/completions' || $uri === '/chat/completions' || $uri === '/v1/responses' || $uri === '/responses' || $uri === '/v1/codex/responses') {
+        $is_proxy_post = true;
+        $is_responses_endpoint = ($uri === '/v1/responses' || $uri === '/responses' || $uri === '/v1/codex/responses');
+    } elseif (preg_match('#^/v1/(minimal|none|low|medium|high|xhigh|max|ultra)/(chat/completions|responses|codex/responses)$#i', $uri, $um)) {
+        $is_proxy_post = true;
+        $uri_reasoning_override = strtolower($um[1]);
+        $is_responses_endpoint = (strtolower($um[2]) !== 'chat/completions');
+    }
+}
+
+if ($is_proxy_post) {
     if (!is_authenticated() && !check_proxy_auth()) {
         http_response_code(401);
         echo json_encode(['error' => ['message' => 'Unauthorized. Provide Bearer token or log in.']]);
@@ -1608,7 +1838,6 @@ if (($uri === '/v1/chat/completions' || $uri === '/chat/completions' || $uri ===
 
     $raw_body = file_get_contents('php://input');
     $payload = json_decode($raw_body, true) ?: [];
-    $is_responses_endpoint = ($uri === '/v1/responses' || $uri === '/responses' || $uri === '/v1/codex/responses');
     $native_responses_mode = $is_responses_endpoint && isset($payload['input']) && !isset($payload['messages']);
     $is_stream = isset($payload['stream']) ? !empty($payload['stream']) : $native_responses_mode;
 
@@ -1628,7 +1857,8 @@ if (($uri === '/v1/chat/completions' || $uri === '/chat/completions' || $uri ===
         // Route through Codex Rust Backend if this is a ChatGPT OAuth Account
         if ($is_codex_oauth) {
             $codex_model = resolve_codex_model($payload['model'] ?? '', $route['model'] ?? 'gpt-6-luna');
-            list($codex_payload, $cache_key) = build_codex_payload($payload, $codex_model, $route['id']);
+            $route_default_effort = $route['reasoning_effort'] ?? 'medium';
+            list($codex_payload, $cache_key, $user_effort) = build_codex_payload($payload, $codex_model, $route['id'], $route_default_effort, $uri_reasoning_override);
 
             list($ok, $http_code, $err_raw, $usage_stats, $header_quota) = call_codex_backend(
                 $api_key,
@@ -1637,7 +1867,8 @@ if (($uri === '/v1/chat/completions' || $uri === '/chat/completions' || $uri ===
                 $route['name'],
                 $codex_model,
                 $cache_key,
-                $native_responses_mode
+                $native_responses_mode,
+                $user_effort
             );
 
             // Auto-refresh token on 401
@@ -1659,7 +1890,8 @@ if (($uri === '/v1/chat/completions' || $uri === '/chat/completions' || $uri ===
                         $route['name'],
                         $codex_model,
                         $cache_key,
-                        $native_responses_mode
+                        $native_responses_mode,
+                        $user_effort
                     );
                 }
             }
@@ -1756,6 +1988,8 @@ function record_outcome(&$state, $id, $success, $code = null, $err = null, $usag
                 $a['total_tokens'] = ($a['total_tokens'] ?? 0) + intval($usage_stats['total_tokens'] ?? 0);
                 $cached = intval($usage_stats['cached_tokens'] ?? ($usage_stats['prompt_tokens_details']['cached_tokens'] ?? 0));
                 $a['cached_tokens'] = ($a['cached_tokens'] ?? 0) + $cached;
+                $reasoning_tok = intval($usage_stats['reasoning_tokens'] ?? ($usage_stats['completion_tokens_details']['reasoning_tokens'] ?? 0));
+                $a['reasoning_tokens'] = ($a['reasoning_tokens'] ?? 0) + $reasoning_tok;
             }
             if (is_array($quota_update)) {
                 $a['quota'] = array_merge($a['quota'] ?? [], $quota_update);
@@ -2365,9 +2599,10 @@ function handle_mock_streaming($route, $payload) {
             </div>
           </div>
           <div class="route-box">
-            <div class="route-label">Model Target</div>
+            <div class="route-label">Model & Reasoning</div>
             <div class="route-row">
               <span class="route-val" id="exportModel">...</span>
+              <span class="pill pill-oauth" id="exportReasoningPill" style="font-family:var(--font-mono); font-size:11px;">medium</span>
               <button class="btn btn-sm" onclick="copyText('exportModel')">Copy</button>
             </div>
           </div>
@@ -2409,7 +2644,7 @@ function handle_mock_streaming($route, $payload) {
               <th>Status</th>
               <th>Account</th>
               <th>Type</th>
-              <th>Model</th>
+              <th>Model & Reasoning</th>
               <th>Quota / Tokens Left</th>
               <th>Priority</th>
               <th>Cooldown</th>
@@ -2438,8 +2673,17 @@ function handle_mock_streaming($route, $payload) {
       </div>
       <div class="card-body">
         <div class="stream-box" id="streamOutput" style="margin-bottom: 12px; min-height: 200px;">Send a message below to stream back-and-forth with Codex (`gpt-6-luna`) using persistent `x-codex-turn-state` + `prompt_cache_key` KV caching...</div>
-        <div style="display: flex; gap: 8px;">
-          <input type="text" id="testPrompt" style="flex: 1;" placeholder="Type a message and press Enter to stream back-and-forth..." value="Remember the secret codeword: AURORA-7. Confirm in one short sentence." onkeydown="if(event.key==='Enter') runStreamingTest()" />
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <select id="testReasoningEffort" title="Reasoning Effort Mode" style="font-family: var(--font-mono); font-size: 12px; color: #ff9d66; min-width: 150px;">
+            <option value="">Reasoning: Account Default</option>
+            <option value="minimal">Reasoning: minimal</option>
+            <option value="low">Reasoning: low</option>
+            <option value="medium" selected>Reasoning: medium</option>
+            <option value="high">Reasoning: high</option>
+            <option value="xhigh">Reasoning: xhigh</option>
+            <option value="max">Reasoning: max</option>
+          </select>
+          <input type="text" id="testPrompt" style="flex: 1; min-width: 240px;" placeholder="Type a message and press Enter to stream back-and-forth..." value="Remember the secret codeword: AURORA-7. Confirm in one short sentence." onkeydown="if(event.key==='Enter') runStreamingTest()" />
           <button class="btn btn-primary" id="streamBtn" onclick="runStreamingTest()">
             Send & Stream
           </button>
@@ -2638,6 +2882,8 @@ function handle_mock_streaming($route, $payload) {
         document.getElementById('exportBaseUrl').innerText = data.route.base_url;
         document.getElementById('exportApiKey').innerText = data.route.proxy_key || data.route.api_key;
         document.getElementById('exportModel').innerText = data.route.model;
+        const rPill = document.getElementById('exportReasoningPill');
+        if (rPill) rPill.innerText = data.route.reasoning_effort || 'medium';
 
         const q = data.route.quota;
         const totTok = Number(data.route.total_tokens || 0).toLocaleString();
@@ -2664,6 +2910,7 @@ function handle_mock_streaming($route, $payload) {
     function renderTabSnippet() {
       if (!currentExportData) return;
       const el = document.getElementById('exportSnippet');
+      const eff = currentExportData.route.reasoning_effort || 'medium';
       if (activeTab === 'env') el.innerText = currentExportData.env_format;
       else if (activeTab === 'json') el.innerText = currentExportData.json_format;
       else if (activeTab === 'bash') el.innerText = currentExportData.bash_export;
@@ -2674,11 +2921,12 @@ OPENAI_BASE_URL="https://tokenswitch.zipperi.com/v1"
 OPENAI_API_KEY="Its.me@12345"
 OPENAI_MODEL="${currentExportData.route.model}"
 
-# Supports both /v1/chat/completions AND native /v1/responses with automatic KV caching:
+# Reasoning modes supported: minimal | low | medium | high | xhigh | max
+# Pass via "reasoning_effort", "reasoning": {"effort": "..."}, model suffix (e.g. "gpt-6-luna-xhigh"), or X-Reasoning-Effort header:
 curl https://tokenswitch.zipperi.com/v1/chat/completions \\
   -H "Authorization: Bearer Its.me@12345" \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gpt-6-luna","messages":[{"role":"user","content":"Hello!"}],"stream":true}'`;
+  -d '{"model":"gpt-6-luna","reasoning_effort":"${eff}","messages":[{"role":"user","content":"Hello!"}],"stream":true}'`;
       }
     }
 
@@ -2718,11 +2966,16 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
         const allOptions = presetModels.includes(currentModel) ? presetModels : [currentModel, ...presetModels];
         const modelOptionsHtml = allOptions.map(m => `<option value="${escapeHtml(m)}" ${m === currentModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('') + '<option value="__custom__">+ Custom model...</option>';
 
+        const reasoningLevels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+        const currentEffort = acc.reasoning_effort || 'medium';
+        const reasoningOptionsHtml = reasoningLevels.map(r => `<option value="${r}" ${r === currentEffort ? 'selected' : ''}>🧠 ${r}</option>`).join('');
+
         const totalTok = Number(acc.total_tokens || 0).toLocaleString();
         const inTok = Number(acc.prompt_tokens || 0).toLocaleString();
         const outTok = Number(acc.completion_tokens || 0).toLocaleString();
         const cachedTok = Number(acc.cached_tokens || 0).toLocaleString();
-        const tokLine = `<div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono); margin-top:3px;">${totalTok} tok <span style="color:var(--text-dim);">(${inTok} in / ${outTok} out)</span><br/><span style="color:#3fb950;">⚡ ${cachedTok} cached</span></div>`;
+        const reasTok = Number(acc.reasoning_tokens || 0).toLocaleString();
+        const tokLine = `<div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono); margin-top:3px;">${totalTok} tok <span style="color:var(--text-dim);">(${inTok} in / ${outTok} out)</span><br/><span style="color:#3fb950;">⚡ ${cachedTok} cached</span> • <span style="color:#ff9d66;">🧠 ${reasTok} reasoning</span></div>`;
 
         let quotaHtml = '';
         if (acc.quota && typeof acc.quota.remaining_percent !== 'undefined') {
@@ -2773,9 +3026,14 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
             </td>
             <td>${authBadge}</td>
             <td>
-              <select style="font-family:var(--font-mono); font-size:12px; padding:4px 8px; background:#0b0d10; border:1px solid var(--border); color:#ff9d66; border-radius:4px; cursor:pointer;" onchange="updateAccountModel('${acc.id}', this.value, '${escapeHtml(currentModel)}')">
-                ${modelOptionsHtml}
-              </select>
+              <div style="display:flex; flex-direction:column; gap:4px;">
+                <select style="font-family:var(--font-mono); font-size:12px; padding:4px 8px; background:#0b0d10; border:1px solid var(--border); color:#ff9d66; border-radius:4px; cursor:pointer;" onchange="updateAccountModel('${acc.id}', this.value, '${escapeHtml(currentModel)}')">
+                  ${modelOptionsHtml}
+                </select>
+                <select title="Default Reasoning Effort (can be overridden per API request)" style="font-family:var(--font-mono); font-size:11px; padding:3px 8px; background:#0b0d10; border:1px solid var(--border); color:#3fb950; border-radius:4px; cursor:pointer;" onchange="updateAccountReasoning('${acc.id}', this.value)">
+                  ${reasoningOptionsHtml}
+                </select>
+              </div>
             </td>
             <td>${quotaHtml}</td>
             <td>P${acc.priority}</td>
@@ -2815,6 +3073,20 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
         showToast(`Updated model to ${targetModel}`);
       } else {
         showToast('Failed to update model');
+      }
+      fetchStatus();
+    }
+
+    async function updateAccountReasoning(id, effort) {
+      const res = await fetch(`/api/accounts/${id}/reasoning`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reasoning_effort: effort })
+      });
+      if (res.ok) {
+        showToast(`Updated reasoning mode to ${effort}`);
+      } else {
+        showToast('Failed to update reasoning mode');
       }
       fetchStatus();
     }
@@ -2961,6 +3233,8 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
 
     async function runStreamingTest() {
       const inputEl = document.getElementById('testPrompt');
+      const effortEl = document.getElementById('testReasoningEffort');
+      const selectedEffort = effortEl ? effortEl.value : '';
       const prompt = inputEl.value.trim();
       if (!prompt) return;
 
@@ -2989,22 +3263,28 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
       let usageInfo = null;
 
       try {
+        const reqBody = {
+          prompt_cache_key: chatSessionId,
+          messages: chatHistory,
+          stream: true
+        };
+        if (selectedEffort) {
+          reqBody.reasoning_effort = selectedEffort;
+        }
+
         const response = await fetch('/v1/chat/completions', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'X-Session-Id': chatSessionId
           },
-          body: JSON.stringify({
-            prompt_cache_key: chatSessionId,
-            messages: chatHistory,
-            stream: true
-          })
+          body: JSON.stringify(reqBody)
         });
 
         const activeName = response.headers.get('X-Routed-Account') || 'Active Account';
         const activeModel = response.headers.get('X-Routed-Model') || 'Model';
-        infoEl.innerText = `Routed: ${activeName} (${activeModel})`;
+        const activeEffort = response.headers.get('X-Reasoning-Effort') || selectedEffort || 'medium';
+        infoEl.innerText = `Routed: ${activeName} (${activeModel} • 🧠 ${activeEffort})`;
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder('utf-8');
@@ -3045,8 +3325,9 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
         chatHistory.push({ role: 'assistant', content: assistantReply });
         if (usageInfo) {
           const cached = usageInfo.prompt_tokens_details?.cached_tokens || 0;
+          const reasTok = usageInfo.completion_tokens_details?.reasoning_tokens || 0;
           const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
-          statsEl.innerText = `Turn ${turnNumber} • ${usageInfo.prompt_tokens} in (⚡ ${cached} cached) / ${usageInfo.completion_tokens} out (${elapsed}s)`;
+          statsEl.innerText = `Turn ${turnNumber} • ${usageInfo.prompt_tokens} in (⚡ ${cached} cached) / ${usageInfo.completion_tokens} out (🧠 ${reasTok} reasoning) (${elapsed}s)`;
         }
         if (turnNumber === 1) {
           inputEl.value = 'What was the secret codeword I just told you?';
