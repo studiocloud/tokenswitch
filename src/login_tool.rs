@@ -372,7 +372,7 @@ fn handle_client(mut stream: TcpStream, store: VerifierStore) {
         }
 
         let auth_url = format!(
-            "https://auth.openai.com/oauth/authorize?response_type=code&client_id={}&redirect_uri=http%3A%2F%2Flocalhost%3A{}%2Fauth%2Fcallback&scope=openid+profile+email+offline_access&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator=codex_cli_rs",
+            "https://auth.openai.com/oauth/authorize?response_type=code&client_id={}&redirect_uri=http%3A%2F%2Flocalhost%3A{}%2Fauth%2Fcallback&scope=openid+profile+email+offline_access&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator=codex_cli_rs&prompt=login",
             OPENAI_CLIENT_ID,
             REDIRECT_PORT,
             code_challenge,
