@@ -372,6 +372,10 @@ if ($uri === '/api/status' && $method === 'GET') {
             'total_requests' => $acc['total_requests'] ?? 0,
             'total_successes' => $acc['total_successes'] ?? 0,
             'total_failures' => $acc['total_failures'] ?? 0,
+            'total_tokens' => $acc['total_tokens'] ?? 0,
+            'prompt_tokens' => $acc['prompt_tokens'] ?? 0,
+            'completion_tokens' => $acc['completion_tokens'] ?? 0,
+            'quota' => $acc['quota'] ?? null,
             'last_error' => $acc['last_error'] ?? null,
             'is_active_route' => ($acc['id'] === $active_id)
         ];
@@ -413,7 +417,9 @@ if ($uri === '/api/export' && $method === 'GET') {
         'id' => $route['id'],
         'name' => $route['name'],
         'auth_type' => $route['auth_type'] ?? 'api_key',
-        'upstream_token' => $route['api_key']
+        'upstream_token' => $route['api_key'],
+        'quota' => $route['quota'] ?? null,
+        'total_tokens' => $route['total_tokens'] ?? 0
     ], JSON_PRETTY_PRINT);
     $bash = "export OPENAI_BASE_URL=\"{$proxy_base}\"\nexport OPENAI_API_KEY=\"{$proxy_key}\"\nexport OPENAI_MODEL=\"{$route['model']}\"";
     $powershell = "\$env:OPENAI_BASE_URL=\"{$proxy_base}\"\n\$env:OPENAI_API_KEY=\"{$proxy_key}\"\n\$env:OPENAI_MODEL=\"{$route['model']}\"";
@@ -440,6 +446,102 @@ function extract_jwt_claims($jwt) {
         if (is_array($claims)) return $claims;
     }
     return [];
+}
+
+function fetch_codex_usage($api_key) {
+    $claims = extract_jwt_claims($api_key);
+    $chatgpt_acc_id = $claims['https://api.openai.com/auth']['chatgpt_account_id'] ?? '';
+
+    $headers = [
+        "Authorization: Bearer $api_key",
+        "originator: codex_cli_rs",
+        "User-Agent: codex_cli_rs/99.99.99",
+        "Accept: application/json"
+    ];
+    if (!empty($chatgpt_acc_id)) {
+        $headers[] = "ChatGPT-Account-Id: $chatgpt_acc_id";
+    }
+
+    $ch = curl_init('https://chatgpt.com/backend-api/wham/usage');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_HTTPHEADER => $headers
+    ]);
+    $res = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($http_code !== 200 || empty($res)) {
+        return [false, $http_code, null];
+    }
+
+    $data = json_decode($res, true);
+    if (!is_array($data)) {
+        return [false, $http_code, null];
+    }
+
+    $primary = $data['rate_limit']['primary_window'] ?? null;
+    $secondary = $data['rate_limit']['secondary_window'] ?? null;
+    $used_pct = isset($primary['used_percent']) ? floatval($primary['used_percent']) : 0;
+    $remaining_pct = max(0, min(100, 100 - $used_pct));
+
+    $sec_used_pct = isset($secondary['used_percent']) ? floatval($secondary['used_percent']) : null;
+    $sec_remaining_pct = ($sec_used_pct !== null) ? max(0, min(100, 100 - $sec_used_pct)) : null;
+
+    $quota = [
+        'plan_type' => $data['plan_type'] ?? 'free',
+        'allowed' => $data['rate_limit']['allowed'] ?? true,
+        'limit_reached' => $data['rate_limit']['limit_reached'] ?? false,
+        'used_percent' => $used_pct,
+        'remaining_percent' => $remaining_pct,
+        'window_seconds' => $primary['limit_window_seconds'] ?? null,
+        'reset_after_seconds' => $primary['reset_after_seconds'] ?? null,
+        'reset_at' => $primary['reset_at'] ?? null,
+        'secondary_used_percent' => $sec_used_pct,
+        'secondary_remaining_percent' => $sec_remaining_pct,
+        'secondary_reset_at' => $secondary['reset_at'] ?? null,
+        'credits_balance' => $data['credits']['balance'] ?? null,
+        'credits_unlimited' => $data['credits']['unlimited'] ?? false,
+        'updated_at' => time()
+    ];
+
+    return [true, 200, $quota];
+}
+
+// Live Usage / Quota Sync across connected Codex OAuth accounts
+if ($uri === '/api/usage/sync' && ($method === 'POST' || $method === 'GET')) {
+    if (!is_authenticated() && !check_proxy_auth()) {
+        http_response_code(401);
+        echo json_encode(['status' => 'error', 'message' => 'Unauthorized']);
+        exit;
+    }
+
+    $state = load_state($DATA_FILE);
+    $synced = 0;
+
+    foreach ($state['accounts'] as &$acc) {
+        $api_key = $acc['api_key'] ?? '';
+        $is_codex_oauth = (($acc['auth_type'] ?? '') === 'chatgpt_oauth') || str_starts_with($api_key, 'eyJ');
+        if (!$is_codex_oauth) continue;
+
+        list($ok, $code, $quota) = fetch_codex_usage($api_key);
+        if (!$ok && $code === 401 && !empty($acc['refresh_token'])) {
+            $new_token = refresh_openai_token($acc['refresh_token']);
+            if ($new_token) {
+                $acc['api_key'] = $new_token;
+                list($ok, $code, $quota) = fetch_codex_usage($new_token);
+            }
+        }
+        if ($ok && $quota) {
+            $acc['quota'] = $quota;
+            $synced++;
+        }
+    }
+
+    save_state($DATA_FILE, $state);
+    echo json_encode(['status' => 'ok', 'synced' => $synced]);
+    exit;
 }
 
 // Direct OpenAI Account OAuth / Access Token connect
@@ -483,12 +585,16 @@ if ($uri === '/api/accounts/oauth-connect' && $method === 'POST') {
         $display_name = "OpenAI Account ($email)";
     }
 
+    // Fetch live initial quota from Codex backend
+    list($q_ok, $q_code, $initial_quota) = fetch_codex_usage($token);
+
     $state = load_state($DATA_FILE);
     $found = false;
     foreach ($state['accounts'] as &$acc) {
         if ($acc['name'] === $display_name || $acc['id'] === $id) {
             $acc['api_key'] = $token;
             if (!empty($refresh_token)) $acc['refresh_token'] = $refresh_token;
+            if ($initial_quota) $acc['quota'] = $initial_quota;
             $acc['enabled'] = true;
             $acc['failure_count'] = 0;
             $acc['cooldown_until'] = 0;
@@ -514,6 +620,10 @@ if ($uri === '/api/accounts/oauth-connect' && $method === 'POST') {
             'total_requests' => 0,
             'total_successes' => 0,
             'total_failures' => 0,
+            'total_tokens' => 0,
+            'prompt_tokens' => 0,
+            'completion_tokens' => 0,
+            'quota' => $initial_quota ?: null,
             'cooldown_until' => 0,
             'last_error' => null
         ];
@@ -770,6 +880,12 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
     $full_text = '';
     $headers_sent = false;
     $chunk_id = 'chatcmpl-' . bin2hex(random_bytes(6));
+    $live_headers = [];
+    $usage_stats = [
+        'prompt_tokens' => 0,
+        'completion_tokens' => 0,
+        'total_tokens' => 0
+    ];
 
     curl_setopt_array($ch, [
         CURLOPT_POST => true,
@@ -777,7 +893,15 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
         CURLOPT_TIMEOUT => 120,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_RETURNTRANSFER => false,
-        CURLOPT_WRITEFUNCTION => function($ch, $data) use (&$raw_response, &$full_text, &$headers_sent, $is_stream, $route_name, $codex_model, $chunk_id) {
+        CURLOPT_HEADERFUNCTION => function($ch, $header_line) use (&$live_headers) {
+            $len = strlen($header_line);
+            $parts = explode(':', $header_line, 2);
+            if (count($parts) === 2) {
+                $live_headers[strtolower(trim($parts[0]))] = trim($parts[1]);
+            }
+            return $len;
+        },
+        CURLOPT_WRITEFUNCTION => function($ch, $data) use (&$raw_response, &$full_text, &$headers_sent, &$usage_stats, &$live_headers, $is_stream, $route_name, $codex_model, $chunk_id) {
             $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             if ($http_code !== 200) {
                 $raw_response .= $data;
@@ -791,6 +915,10 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 header('X-Accel-Buffering: no');
                 header("X-Routed-Account: $route_name");
                 header("X-Routed-Model: $codex_model");
+                if (isset($live_headers['x-codex-primary-used-percent'])) {
+                    $rem = max(0, 100 - floatval($live_headers['x-codex-primary-used-percent']));
+                    header("X-Quota-Remaining-Percent: $rem");
+                }
                 if (function_exists('apache_setenv')) @apache_setenv('no-gzip', '1');
                 @ini_set('output_buffering', 'off');
                 @ini_set('zlib.output_compression', false);
@@ -807,26 +935,33 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                 if (str_starts_with($trimmed, 'data: ')) {
                     $json_str = substr($trimmed, 6);
                     $ev = json_decode($json_str, true);
-                    if (isset($ev['type']) && $ev['type'] === 'response.output_text.delta' && isset($ev['delta'])) {
-                        $delta_text = $ev['delta'];
-                        $full_text .= $delta_text;
-                        if ($is_stream) {
-                            $out_chunk = [
-                                'id' => $chunk_id,
-                                'object' => 'chat.completion.chunk',
-                                'created' => time(),
-                                'model' => $codex_model,
-                                'choices' => [
-                                    [
-                                        'index' => 0,
-                                        'delta' => ['content' => $delta_text],
-                                        'finish_reason' => null
+                    if (isset($ev['type'])) {
+                        if ($ev['type'] === 'response.output_text.delta' && isset($ev['delta'])) {
+                            $delta_text = $ev['delta'];
+                            $full_text .= $delta_text;
+                            if ($is_stream) {
+                                $out_chunk = [
+                                    'id' => $chunk_id,
+                                    'object' => 'chat.completion.chunk',
+                                    'created' => time(),
+                                    'model' => $codex_model,
+                                    'choices' => [
+                                        [
+                                            'index' => 0,
+                                            'delta' => ['content' => $delta_text],
+                                            'finish_reason' => null
+                                        ]
                                     ]
-                                ]
-                            ];
-                            echo "data: " . json_encode($out_chunk) . "\n\n";
-                            @ob_flush();
-                            @flush();
+                                ];
+                                echo "data: " . json_encode($out_chunk) . "\n\n";
+                                @ob_flush();
+                                @flush();
+                            }
+                        } elseif ($ev['type'] === 'response.completed' && isset($ev['response']['usage'])) {
+                            $u = $ev['response']['usage'];
+                            $usage_stats['prompt_tokens'] = intval($u['input_tokens'] ?? 0);
+                            $usage_stats['completion_tokens'] = intval($u['output_tokens'] ?? 0);
+                            $usage_stats['total_tokens'] = intval($u['total_tokens'] ?? ($usage_stats['prompt_tokens'] + $usage_stats['completion_tokens']));
                         }
                     }
                 }
@@ -841,6 +976,27 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
     $curl_err = curl_error($ch);
     curl_close($ch);
 
+    $header_quota = null;
+    if (isset($live_headers['x-codex-primary-used-percent'])) {
+        $used_pct = floatval($live_headers['x-codex-primary-used-percent']);
+        $sec_used = (isset($live_headers['x-codex-secondary-used-percent']) && $live_headers['x-codex-secondary-used-percent'] !== '')
+            ? floatval($live_headers['x-codex-secondary-used-percent']) : null;
+        $win_mins = isset($live_headers['x-codex-primary-window-minutes']) ? intval($live_headers['x-codex-primary-window-minutes']) : null;
+        $header_quota = [
+            'plan_type' => $live_headers['x-codex-plan-type'] ?? 'free',
+            'allowed' => ($http_code === 200),
+            'limit_reached' => ($used_pct >= 100),
+            'used_percent' => $used_pct,
+            'remaining_percent' => max(0, min(100, 100 - $used_pct)),
+            'window_seconds' => $win_mins ? ($win_mins * 60) : null,
+            'reset_after_seconds' => isset($live_headers['x-codex-primary-reset-after-seconds']) ? intval($live_headers['x-codex-primary-reset-after-seconds']) : null,
+            'reset_at' => isset($live_headers['x-codex-primary-reset-at']) ? intval($live_headers['x-codex-primary-reset-at']) : null,
+            'secondary_used_percent' => $sec_used,
+            'secondary_remaining_percent' => ($sec_used !== null) ? max(0, min(100, 100 - $sec_used)) : null,
+            'updated_at' => time()
+        ];
+    }
+
     if ($http_code === 200) {
         if ($is_stream) {
             $done_chunk = [
@@ -854,7 +1010,8 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                         'delta' => new stdClass(),
                         'finish_reason' => 'stop'
                     ]
-                ]
+                ],
+                'usage' => $usage_stats
             ];
             echo "data: " . json_encode($done_chunk) . "\n\n";
             echo "data: [DONE]\n\n";
@@ -864,6 +1021,9 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
             header('Content-Type: application/json');
             header("X-Routed-Account: $route_name");
             header("X-Routed-Model: $codex_model");
+            if ($header_quota) {
+                header("X-Quota-Remaining-Percent: {$header_quota['remaining_percent']}");
+            }
             echo json_encode([
                 'id' => $chunk_id,
                 'object' => 'chat.completion',
@@ -879,17 +1039,13 @@ function call_codex_backend($api_key, $codex_payload, $is_stream, $route_name, $
                         'finish_reason' => 'stop'
                     ]
                 ],
-                'usage' => [
-                    'prompt_tokens' => 0,
-                    'completion_tokens' => 0,
-                    'total_tokens' => 0
-                ]
+                'usage' => $usage_stats
             ]);
         }
-        return [true, 200, null];
+        return [true, 200, null, $usage_stats, $header_quota];
     }
 
-    return [false, $http_code, $raw_response ?: $curl_err];
+    return [false, $http_code, $raw_response ?: $curl_err, $usage_stats, $header_quota];
 }
 
 // ---------------- REVERSE PROXY ROUTE WITH AUTO-REFRESH & FAILOVER ----------------
@@ -922,7 +1078,7 @@ if (($uri === '/v1/chat/completions' || $uri === '/v1/responses') && $method ===
             $codex_model = resolve_codex_model($payload['model'] ?? '', $route['model'] ?? 'gpt-6-luna');
             $codex_payload = build_codex_payload($payload, $codex_model);
 
-            list($ok, $http_code, $err_raw) = call_codex_backend($api_key, $codex_payload, $is_stream, $route['name'], $codex_model);
+            list($ok, $http_code, $err_raw, $usage_stats, $header_quota) = call_codex_backend($api_key, $codex_payload, $is_stream, $route['name'], $codex_model);
 
             // Auto-refresh token on 401
             if (!$ok && $http_code === 401 && !empty($route['refresh_token'])) {
@@ -936,18 +1092,18 @@ if (($uri === '/v1/chat/completions' || $uri === '/v1/responses') && $method ===
                     }
                     save_state($DATA_FILE, $state);
                     $api_key = $new_access;
-                    list($ok, $http_code, $err_raw) = call_codex_backend($api_key, $codex_payload, $is_stream, $route['name'], $codex_model);
+                    list($ok, $http_code, $err_raw, $usage_stats, $header_quota) = call_codex_backend($api_key, $codex_payload, $is_stream, $route['name'], $codex_model);
                 }
             }
 
             if ($ok) {
-                record_outcome($state, $route['id'], true);
+                record_outcome($state, $route['id'], true, 200, null, $usage_stats, $header_quota);
                 save_state($DATA_FILE, $state);
                 exit;
             } else {
                 $err_json = json_decode($err_raw, true);
                 $detail = $err_json['detail'] ?? ($err_json['error']['message'] ?? "HTTP $http_code");
-                record_outcome($state, $route['id'], false, $http_code, $detail);
+                record_outcome($state, $route['id'], false, $http_code, $detail, $usage_stats, $header_quota);
                 $state['round_robin_idx'] = ($state['round_robin_idx'] ?? 0) + 1;
                 save_state($DATA_FILE, $state);
                 $attempt++;
@@ -988,7 +1144,9 @@ if (($uri === '/v1/chat/completions' || $uri === '/v1/responses') && $method ===
         curl_close($ch);
 
         if ($http_code === 200) {
-            record_outcome($state, $route['id'], true);
+            $parsed = json_decode($res, true);
+            $std_usage = $parsed['usage'] ?? null;
+            record_outcome($state, $route['id'], true, 200, null, $std_usage);
             save_state($DATA_FILE, $state);
 
             if ($is_stream) {
@@ -1020,10 +1178,18 @@ if (($uri === '/v1/chat/completions' || $uri === '/v1/responses') && $method ===
     exit;
 }
 
-function record_outcome(&$state, $id, $success, $code = null, $err = null) {
+function record_outcome(&$state, $id, $success, $code = null, $err = null, $usage_stats = null, $quota_update = null) {
     foreach ($state['accounts'] as &$a) {
         if ($a['id'] === $id) {
             $a['total_requests'] = ($a['total_requests'] ?? 0) + 1;
+            if (is_array($usage_stats)) {
+                $a['prompt_tokens'] = ($a['prompt_tokens'] ?? 0) + intval($usage_stats['prompt_tokens'] ?? 0);
+                $a['completion_tokens'] = ($a['completion_tokens'] ?? 0) + intval($usage_stats['completion_tokens'] ?? 0);
+                $a['total_tokens'] = ($a['total_tokens'] ?? 0) + intval($usage_stats['total_tokens'] ?? 0);
+            }
+            if (is_array($quota_update)) {
+                $a['quota'] = array_merge($a['quota'] ?? [], $quota_update);
+            }
             if ($success) {
                 $a['total_successes'] = ($a['total_successes'] ?? 0) + 1;
                 $a['failure_count'] = 0;
@@ -1635,6 +1801,13 @@ function handle_mock_streaming($route, $payload) {
               <button class="btn btn-sm" onclick="copyText('exportModel')">Copy</button>
             </div>
           </div>
+          <div class="route-box">
+            <div class="route-label">Quota & Tokens Left</div>
+            <div class="route-row">
+              <span class="route-val" id="exportQuota">Syncing...</span>
+              <button class="btn btn-sm" onclick="syncUsage(false)">Sync</button>
+            </div>
+          </div>
         </div>
 
         <div class="tabs">
@@ -1655,6 +1828,7 @@ function handle_mock_streaming($route, $payload) {
         <div class="card-title">Configured Account Pool</div>
         <div style="display: flex; gap: 8px;">
           <button class="btn btn-sm btn-primary" onclick="triggerOpenAiLogin()">Login to OpenAI</button>
+          <button class="btn btn-sm" id="syncUsageBtn" onclick="syncUsage(false)">Sync Usage</button>
           <button class="btn btn-sm" onclick="fetchStatus()">Refresh</button>
         </div>
       </div>
@@ -1666,6 +1840,7 @@ function handle_mock_streaming($route, $payload) {
               <th>Account</th>
               <th>Type</th>
               <th>Model</th>
+              <th>Quota / Tokens Left</th>
               <th>Priority</th>
               <th>Cooldown</th>
               <th>Success / Fail</th>
@@ -1673,7 +1848,7 @@ function handle_mock_streaming($route, $payload) {
             </tr>
           </thead>
           <tbody id="accountsTableBody">
-            <tr><td colspan="8" style="text-align: center; color: var(--text-dim); padding: 24px;">Loading accounts...</td></tr>
+            <tr><td colspan="9" style="text-align: center; color: var(--text-dim); padding: 24px;">Loading accounts...</td></tr>
           </tbody>
         </table>
       </div>
@@ -1804,9 +1979,50 @@ function handle_mock_streaming($route, $payload) {
   <script>
     let currentExportData = null;
     let activeTab = 'env';
+    let autoSyncTriggered = false;
 
     function escapeHtml(str) {
       return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function formatResetTime(resetAt, resetAfterSecs) {
+      let secs = 0;
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (resetAt && resetAt > nowSec) {
+        secs = resetAt - nowSec;
+      } else if (resetAfterSecs && resetAfterSecs > 0) {
+        secs = resetAfterSecs;
+      }
+      if (secs <= 0) return '';
+      const days = Math.floor(secs / 86400);
+      const hours = Math.floor((secs % 86400) / 3600);
+      const mins = Math.floor((secs % 3600) / 60);
+      if (days > 0) return `Resets in ${days}d ${hours}h`;
+      if (hours > 0) return `Resets in ${hours}h ${mins}m`;
+      return `Resets in ${mins}m`;
+    }
+
+    async function syncUsage(silent = false) {
+      const btn = document.getElementById('syncUsageBtn');
+      if (btn && !silent) {
+        btn.disabled = true;
+        btn.innerText = 'Syncing...';
+      }
+      try {
+        const res = await fetch('/api/usage/sync', { method: 'POST' });
+        const data = await res.json();
+        if (!silent && res.ok) {
+          showToast(`Synced live quota for ${data.synced || 0} account(s)`);
+        }
+        await fetchStatus();
+      } catch (err) {
+        if (!silent) showToast('Failed to sync quota');
+      } finally {
+        if (btn && !silent) {
+          btn.disabled = false;
+          btn.innerText = 'Sync Usage';
+        }
+      }
     }
 
     async function fetchStatus() {
@@ -1817,6 +2033,18 @@ function handle_mock_streaming($route, $payload) {
         renderAccounts(data.accounts);
         document.getElementById('strategySelect').value = data.strategy;
         await fetchExportRoute();
+
+        if (!autoSyncTriggered && data.accounts) {
+          const nowSec = Math.floor(Date.now() / 1000);
+          const needsSync = data.accounts.some(a =>
+            (a.auth_type === 'chatgpt_oauth' || (a.api_key && a.api_key.startsWith('eyJ'))) &&
+            (!a.quota || !a.quota.updated_at || (nowSec - a.quota.updated_at) > 300)
+          );
+          if (needsSync) {
+            autoSyncTriggered = true;
+            syncUsage(true);
+          }
+        }
       } catch (err) {
         console.error(err);
       }
@@ -1836,6 +2064,18 @@ function handle_mock_streaming($route, $payload) {
         document.getElementById('exportBaseUrl').innerText = data.route.base_url;
         document.getElementById('exportApiKey').innerText = data.route.proxy_key || data.route.api_key;
         document.getElementById('exportModel').innerText = data.route.model;
+
+        const q = data.route.quota;
+        const totTok = Number(data.route.total_tokens || 0).toLocaleString();
+        const quotaEl = document.getElementById('exportQuota');
+        if (q && typeof q.remaining_percent !== 'undefined') {
+          const plan = String(q.plan_type || 'free').toUpperCase();
+          quotaEl.innerText = `${q.remaining_percent}% Left (${plan}) • ${totTok} tok`;
+          quotaEl.style.color = q.remaining_percent > 30 ? '#3fb950' : (q.remaining_percent > 10 ? '#e3b341' : '#f85149');
+        } else {
+          quotaEl.innerText = `${totTok} tokens used`;
+          quotaEl.style.color = '#ff9d66';
+        }
 
         document.getElementById('activeAccountPill').innerText = `Active: ${data.route.name}`;
         document.getElementById('activeAccountPill').className = 'pill pill-active';
@@ -1877,7 +2117,7 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
     function renderAccounts(accounts) {
       const tbody = document.getElementById('accountsTableBody');
       if (!accounts || accounts.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-dim); padding: 24px;">No accounts found. Click "+ Connect OpenAI Account" to add one.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-dim); padding: 24px;">No accounts found. Click "Login to OpenAI" to add one.</td></tr>';
         return;
       }
 
@@ -1893,7 +2133,7 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
           statusBadge = '<span class="pill pill-standby">Standby</span>';
         }
 
-        const isOAuth = acc.auth_type === 'chatgpt_oauth';
+        const isOAuth = acc.auth_type === 'chatgpt_oauth' || (acc.api_key && acc.api_key.startsWith('eyJ'));
         const authBadge = isOAuth
           ? '<span class="pill pill-oauth">Codex OAuth</span>'
           : '<span class="pill pill-key">API Key</span>';
@@ -1902,6 +2142,51 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
         const currentModel = acc.model || 'gpt-6-luna';
         const allOptions = presetModels.includes(currentModel) ? presetModels : [currentModel, ...presetModels];
         const modelOptionsHtml = allOptions.map(m => `<option value="${escapeHtml(m)}" ${m === currentModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('') + '<option value="__custom__">+ Custom model...</option>';
+
+        const totalTok = Number(acc.total_tokens || 0).toLocaleString();
+        const inTok = Number(acc.prompt_tokens || 0).toLocaleString();
+        const outTok = Number(acc.completion_tokens || 0).toLocaleString();
+        const tokLine = `<div style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono); margin-top:3px;">${totalTok} tok <span style="color:var(--text-dim);">(${inTok} in / ${outTok} out)</span></div>`;
+
+        let quotaHtml = '';
+        if (acc.quota && typeof acc.quota.remaining_percent !== 'undefined') {
+          const rem = Number(acc.quota.remaining_percent);
+          const used = Number(acc.quota.used_percent || (100 - rem));
+          const plan = escapeHtml(String(acc.quota.plan_type || 'free').toUpperCase());
+          const barColor = rem > 30 ? '#3fb950' : (rem > 10 ? '#e3b341' : '#f85149');
+          const resetLabel = formatResetTime(acc.quota.reset_at, acc.quota.reset_after_seconds);
+
+          quotaHtml = `
+            <div style="min-width:170px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; font-size:12px; margin-bottom:4px;">
+                <strong style="color:${barColor};">${rem}% Left</strong>
+                <span style="font-size:10px; background:#1f242c; border:1px solid var(--border); padding:1px 5px; border-radius:3px; color:var(--text-muted); font-family:var(--font-mono);">${plan}</span>
+              </div>
+              <div style="width:100%; height:6px; background:#0b0d10; border:1px solid var(--border); border-radius:3px; overflow:hidden;">
+                <div style="width:${Math.max(0, Math.min(100, rem))}%; height:100%; background:${barColor};"></div>
+              </div>
+              <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-dim); margin-top:3px;">
+                <span>${used}% used</span>
+                <span>${escapeHtml(resetLabel)}</span>
+              </div>
+              ${tokLine}
+            </div>
+          `;
+        } else if (isOAuth) {
+          quotaHtml = `
+            <div style="min-width:150px;">
+              <button class="btn btn-sm" onclick="syncUsage(false)" style="font-size:11px; padding:2px 8px;">Sync Quota</button>
+              ${tokLine}
+            </div>
+          `;
+        } else {
+          quotaHtml = `
+            <div style="min-width:140px;">
+              <span style="font-size:11px; color:var(--text-dim);">Standard API</span>
+              ${tokLine}
+            </div>
+          `;
+        }
 
         return `
           <tr>
@@ -1916,6 +2201,7 @@ curl https://tokenswitch.zipperi.com/v1/chat/completions \\
                 ${modelOptionsHtml}
               </select>
             </td>
+            <td>${quotaHtml}</td>
             <td>P${acc.priority}</td>
             <td>${acc.cooldown_secs}s</td>
             <td>

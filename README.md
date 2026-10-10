@@ -167,10 +167,21 @@ Or double-click `login.bat` to start the listener and open the login flow immedi
 | :--- | :--- | :--- |
 | `POST /v1/chat/completions` | `Bearer <key>` or Session | Proxies chat completion requests (streaming & non-streaming) via Codex backend or standard OpenAI API with automatic failover. |
 | `GET /api/status` | Session | Returns current routing strategy (`priority_fallback`, `round_robin`, `least_errors`), active route, and account pool telemetry. |
-| `GET /api/export` | `Bearer <key>` or Session | Exports ready-to-use `.env`, JSON, Bash, and PowerShell configuration snippets. |
-| `POST /api/accounts/oauth-connect` | `Bearer <key>` or Session | Registers or updates a ChatGPT OAuth account (`token`, `refresh_token`, `model`, `priority`). |
+| `GET /api/export` | `Bearer <key>` or Session | Exports ready-to-use `.env`, JSON, Bash, and PowerShell configuration snippets + live quota telemetry. |
+| `POST /api/usage/sync` | `Bearer <key>` or Session | Polls `https://chatgpt.com/backend-api/wham/usage` across all connected Codex OAuth accounts and updates remaining quota %, reset timers, and plan tier. |
+| `POST /api/accounts/oauth-connect` | `Bearer <key>` or Session | Registers or updates a ChatGPT OAuth account (`token`, `refresh_token`, `model`, `priority`) and fetches initial quota. |
 | `POST /api/accounts/{id}/model` | Session | Updates the target model (`gpt-6-luna`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.5`, etc.) for a specific account. |
 | `POST /api/accounts/{id}/toggle` | Session | Pauses or resumes an account in the rotation pool. |
 | `POST /api/switch` | Session | Forces immediate rotation to the next eligible account. |
 | `POST /api/strategy` | Session | Changes the pool routing strategy (`priority_fallback`, `round_robin`, `least_errors`). |
 | `POST /api/report` | Session | Simulates or reports an HTTP error (e.g. `429`) on an account to trigger cooldown and failover. |
+
+### Quota & Token Usage Telemetry
+TokenSwitch tracks both **real-time OpenAI Codex quota remaining (%)** and **exact per-account token consumption**:
+1. **Live Quota Sync (`GET https://chatgpt.com/backend-api/wham/usage`)**:
+   - Returns `plan_type` (`free`, `plus`, `pro`, `team`), `used_percent`, `remaining_percent` (`100 - used_percent`), and `reset_at` / `reset_after_seconds`.
+2. **Zero-Overhead Inference Header Capture (`x-codex-*`)**:
+   - Every `/backend-api/codex/responses` call automatically captures `x-codex-primary-used-percent`, `x-codex-plan-type`, and `x-codex-primary-reset-at` response headers via `CURLOPT_HEADERFUNCTION`, updating the account's remaining quota bar in real time without extra HTTP requests.
+3. **Exact Token Counters (`response.completed`)**:
+   - Extracts `input_tokens`, `output_tokens`, and `total_tokens` from the final `response.completed` SSE frame, returning standard OpenAI `usage` statistics to clients and accumulating `total_tokens`, `prompt_tokens`, and `completion_tokens` per account.
+
