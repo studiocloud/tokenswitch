@@ -1,0 +1,7 @@
+/target/
+cookies.txt
+*.log
+temp_*.php
+raw_api.json
+codex_models.json
+codex_payload*.json
